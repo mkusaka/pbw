@@ -1,0 +1,113 @@
+using System.Text.Json;
+using Pbw.Core;
+
+namespace Pbw.Mcp;
+
+public sealed class McpToolRegistry
+{
+    private readonly string[] names =
+    {
+        "see", "image", "click", "type", "press", "hotkey", "scroll", "drag", "move", "set-value",
+        "perform-action", "window.list", "window.focus", "window.move", "window.resize", "window.set-bounds",
+        "window.minimize", "window.maximize", "window.restore", "window.close", "app.list", "app.launch",
+        "app.focus", "app.switch", "app.quit", "menu.list", "menu.click", "dialog.list", "dialog.click",
+        "dialog.input", "dialog.dismiss", "clipboard.get", "clipboard.set", "clipboard.clear", "clipboard.paste",
+        "snapshot.list", "snapshot.show", "snapshot.inspect", "snapshot.clean", "config.show", "config.validate",
+        "config.get", "config.set", "doctor"
+    };
+
+    public IReadOnlyList<McpTool> ListTools() => names.Select(n => new McpTool(n, $"pbw {n.Replace('.', ' ')}", new Dictionary<string, object?>
+    {
+        ["type"] = "object",
+        ["additionalProperties"] = true
+    })).ToArray();
+}
+
+public sealed record McpTool(string Name, string Description, IReadOnlyDictionary<string, object?> InputSchema);
+
+public interface IPbwCommandExecutor
+{
+    Task<PbwEnvelope<object?>> ExecuteAsync(string command, IReadOnlyDictionary<string, object?> arguments, CancellationToken cancellationToken);
+}
+
+public sealed class McpServer
+{
+    private readonly McpToolRegistry registry;
+    private readonly IPbwCommandExecutor executor;
+
+    public McpServer(McpToolRegistry registry, IPbwCommandExecutor executor)
+    {
+        this.registry = registry;
+        this.executor = executor;
+        Registry = registry;
+    }
+
+    public McpToolRegistry Registry { get; }
+
+    public Task<string> HandleJsonRpcAsync(string json, CancellationToken cancellationToken = default)
+    {
+        using var document = JsonDocument.Parse(json);
+        var root = document.RootElement;
+        var id = root.TryGetProperty("id", out var idElement) ? idElement.Clone() : default;
+        var method = root.GetProperty("method").GetString();
+        return method switch
+        {
+            "initialize" => Task.FromResult(Response(id, new Dictionary<string, object?>
+            {
+                ["protocolVersion"] = "2024-11-05",
+                ["serverInfo"] = new Dictionary<string, object?> { ["name"] = "pbw", ["version"] = "0.1.0" },
+                ["capabilities"] = new Dictionary<string, object?> { ["tools"] = new { }, ["resources"] = new { } }
+            })),
+            "tools/list" => Task.FromResult(Response(id, new Dictionary<string, object?> { ["tools"] = registry.ListTools() })),
+            "tools/call" => HandleToolCall(id, root, cancellationToken),
+            _ => Task.FromResult(Error(id, -32601, "Method not found"))
+        };
+    }
+
+    public async Task RunStdioAsync(TextReader input, TextWriter output, CancellationToken cancellationToken = default)
+    {
+        string? line;
+        while ((line = await input.ReadLineAsync(cancellationToken).ConfigureAwait(false)) is not null)
+        {
+            if (string.IsNullOrWhiteSpace(line)) continue;
+            await output.WriteLineAsync(await HandleJsonRpcAsync(line, cancellationToken).ConfigureAwait(false)).ConfigureAwait(false);
+            await output.FlushAsync().ConfigureAwait(false);
+        }
+    }
+
+    private async Task<string> HandleToolCall(JsonElement id, JsonElement root, CancellationToken cancellationToken)
+    {
+        var parameters = root.GetProperty("params");
+        var name = parameters.GetProperty("name").GetString() ?? "";
+        var args = parameters.TryGetProperty("arguments", out var argsElement) && argsElement.ValueKind == JsonValueKind.Object
+            ? JsonSerializer.Deserialize<Dictionary<string, object?>>(argsElement.GetRawText(), PbwSchema.Json) ?? new()
+            : new Dictionary<string, object?>();
+        if (!registry.ListTools().Any(t => t.Name == name))
+        {
+            return Response(id, ToolEnvelope(PbwEnvelope<object?>.Failure(new PbwError("unknown_tool", $"Tool '{name}' is not registered.", name))));
+        }
+
+        var result = await executor.ExecuteAsync(name, args, cancellationToken).ConfigureAwait(false);
+        return Response(id, ToolEnvelope(result));
+    }
+
+    private static Dictionary<string, object?> ToolEnvelope(PbwEnvelope<object?> envelope) => new()
+    {
+        ["content"] = new[] { new Dictionary<string, object?> { ["type"] = "text", ["text"] = JsonSerializer.Serialize(envelope, PbwSchema.Json) } },
+        ["isError"] = !envelope.Ok
+    };
+
+    private static string Response(JsonElement id, object result) => JsonSerializer.Serialize(new Dictionary<string, object?>
+    {
+        ["jsonrpc"] = "2.0",
+        ["id"] = id.ValueKind == JsonValueKind.Undefined ? null : JsonSerializer.Deserialize<object>(id.GetRawText()),
+        ["result"] = result
+    }, PbwSchema.Json);
+
+    private static string Error(JsonElement id, int code, string message) => JsonSerializer.Serialize(new Dictionary<string, object?>
+    {
+        ["jsonrpc"] = "2.0",
+        ["id"] = id.ValueKind == JsonValueKind.Undefined ? null : JsonSerializer.Deserialize<object>(id.GetRawText()),
+        ["error"] = new Dictionary<string, object?> { ["code"] = code, ["message"] = message }
+    }, PbwSchema.Json);
+}
