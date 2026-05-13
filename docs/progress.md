@@ -18,15 +18,20 @@
 - The repository did not include `docs/pbw-stable-spec.md`; it was created from the task prompt before implementation.
 - A repo-local `NuGet.config` clears inherited user feeds and uses `nuget.org`.
 - The host initially had no .NET SDK installed. Validation was run with a local .NET 8 SDK installed under the user temp directory for this session.
-- UI Automation pattern execution, bitmap capture, and OCR are implemented as safe degraded adapters in this pass. Public contracts are present and return structured results instead of raw exceptions.
+- UI Automation tree reading and common pattern execution are implemented through real Windows UI Automation APIs. Integration tests launch a real WPF process and exercise ValuePattern and InvokePattern.
+- Bitmap capture and annotation are implemented through Win32/GDI `PrintWindow` and `BitBlt` fallback paths, writing annotated BMP snapshots. Windows.Graphics.Capture remains out of scope for this build because the GDI fallback is available and covered.
+- OCR remains a safe empty implementation because Windows OCR WinRT binding is not wired in this pass; the public contract is present and doctor reports the limitation.
 - Clipboard uses Win32 APIs with an in-process fallback for locked/non-interactive clipboard sessions.
 - MCP is stdio-only and does not expose shell execution or a remote listener.
+- MCP tools now expose command-specific JSON schemas and reject additional properties at the schema level.
+- Snapshot redaction is implemented for configured text patterns in element names and OCR text.
 
 ## Validation Results
 
 - `dotnet restore`: passed
 - `dotnet build --configuration Release`: passed with 0 warnings and 0 errors
-- `dotnet test --configuration Release`: passed, 17 passed, 0 failed, 0 skipped
+- `dotnet test --configuration Release`: passed, 66 passed, 0 failed, 0 skipped
 - CLI help: passed, returned a structured JSON envelope
 - `pbw doctor`: passed, returned structured JSON checks
 - MCP tools/list smoke: passed through stdio JSON-RPC and is covered by tests
+- `pbw see`: passed, created a JSON snapshot and annotated BMP image using real desktop/window data

@@ -369,6 +369,37 @@ public sealed class SnapshotStore
     }
 }
 
+public sealed class SnapshotRedactor(RedactionConfig config)
+{
+    public Snapshot Redact(Snapshot snapshot)
+    {
+        if (!config.Enabled || config.TextPatterns.Count == 0) return snapshot;
+        return snapshot with
+        {
+            Elements = snapshot.Elements.Select(RedactElement).ToArray(),
+            OcrText = snapshot.OcrText.Select(t => t with { Text = RedactText(t.Text) }).ToArray()
+        };
+    }
+
+    private ElementSnapshot RedactElement(ElementSnapshot element) => element with
+    {
+        Name = element.Name is null ? null : RedactText(element.Name),
+        Children = element.Children?.Select(RedactElement).ToArray()
+    };
+
+    private string RedactText(string value)
+    {
+        foreach (var pattern in config.TextPatterns.Where(p => !string.IsNullOrWhiteSpace(p)))
+        {
+            if (value.Contains(pattern, StringComparison.OrdinalIgnoreCase))
+            {
+                return "[redacted]";
+            }
+        }
+        return value;
+    }
+}
+
 public sealed record SnapshotSummary(string Id, DateTimeOffset CreatedAt, string Path);
 public sealed record InspectResult(string SnapshotId, ElementSnapshot? Element, string Status);
 public sealed record CleanResult(int Deleted, IReadOnlyList<string> Paths);

@@ -16,11 +16,74 @@ public sealed class McpToolRegistry
         "config.get", "config.set", "doctor"
     };
 
-    public IReadOnlyList<McpTool> ListTools() => names.Select(n => new McpTool(n, $"pbw {n.Replace('.', ' ')}", new Dictionary<string, object?>
+    public IReadOnlyList<McpTool> ListTools() => names.Select(n => new McpTool(n, $"pbw {n.Replace('.', ' ')}", SchemaFor(n))).ToArray();
+
+    private static IReadOnlyDictionary<string, object?> SchemaFor(string name)
     {
-        ["type"] = "object",
-        ["additionalProperties"] = true
-    })).ToArray();
+        var properties = new Dictionary<string, object?>();
+        var required = new List<string>();
+        void Add(string key, string type, bool isRequired = false)
+        {
+            properties[key] = new Dictionary<string, object?> { ["type"] = type };
+            if (isRequired) required.Add(key);
+        }
+
+        if (name is "click" or "set-value" or "perform-action" or "menu.list" or "dialog.click" or "dialog.input" or "dialog.dismiss" or "snapshot.inspect")
+        {
+            Add("id", "string");
+            Add("text", "string");
+            Add("role", "string");
+            Add("automation_id", "string");
+            Add("x", "integer");
+            Add("y", "integer");
+            Add("hwnd", "integer");
+            Add("index", "integer");
+        }
+
+        switch (name)
+        {
+            case "type": Add("text", "string", true); break;
+            case "press": Add("key", "string", true); break;
+            case "hotkey": Add("keys", "string", true); break;
+            case "scroll": Add("delta", "integer"); Add("x", "integer"); Add("y", "integer"); break;
+            case "drag": Add("from_x", "integer", true); Add("from_y", "integer", true); Add("to_x", "integer", true); Add("to_y", "integer", true); break;
+            case "move": Add("x", "integer", true); Add("y", "integer", true); break;
+            case "set-value": Add("value", "string", true); break;
+            case "perform-action": Add("action", "string"); break;
+            case "window.focus":
+            case "window.minimize":
+            case "window.maximize":
+            case "window.restore":
+            case "window.close":
+                Add("hwnd", "integer", true); Add("confirm", "boolean"); break;
+            case "window.move": Add("hwnd", "integer", true); Add("x", "integer", true); Add("y", "integer", true); break;
+            case "window.resize": Add("hwnd", "integer", true); Add("width", "integer", true); Add("height", "integer", true); break;
+            case "window.set-bounds": Add("hwnd", "integer", true); Add("x", "integer", true); Add("y", "integer", true); Add("width", "integer", true); Add("height", "integer", true); break;
+            case "app.launch": Add("path", "string", true); Add("args", "string"); break;
+            case "app.focus":
+            case "app.switch":
+            case "app.quit":
+                Add("name", "string", true); Add("confirm", "boolean"); break;
+            case "menu.click": Add("text", "string", true); break;
+            case "dialog.click": Add("button", "string", true); break;
+            case "dialog.input": Add("value", "string", true); break;
+            case "clipboard.set": Add("text", "string", true); break;
+            case "snapshot.show":
+            case "snapshot.inspect":
+                Add("id", "string", true); break;
+            case "config.get":
+            case "config.set":
+                Add("key", "string", true); if (name == "config.set") Add("value", "string", true); break;
+        }
+
+        return new Dictionary<string, object?>
+        {
+            ["type"] = "object",
+            ["properties"] = properties,
+            ["required"] = required,
+            ["additionalProperties"] = false
+        };
+    }
 }
 
 public sealed record McpTool(string Name, string Description, IReadOnlyDictionary<string, object?> InputSchema);

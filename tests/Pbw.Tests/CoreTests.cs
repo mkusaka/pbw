@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Diagnostics;
 using Pbw.Cli;
 using Pbw.Core;
 using Pbw.Mcp;
@@ -107,6 +108,21 @@ public sealed class CoreTests
         Assert.True(doc.RootElement.GetProperty("ok").GetBoolean());
         Assert.Equal("schema", doc.RootElement.GetProperty("data").GetProperty("id").GetString());
     }
+
+    [Fact]
+    public void SnapshotRedactor_Redacts_Configured_Text_In_Elements_And_Ocr()
+    {
+        var snapshot = Snapshot.Empty("redact") with
+        {
+            Elements = new[] { new ElementSnapshot("e1", "password: secret", "edit", new Bounds(0, 0, 1, 1)) },
+            OcrText = new[] { new OcrTextSnapshot("token value", new Bounds(0, 0, 1, 1)) }
+        };
+
+        var redacted = new SnapshotRedactor(new RedactionConfig(true, new[] { "password", "token" })).Redact(snapshot);
+
+        Assert.Equal("[redacted]", redacted.Elements[0].Name);
+        Assert.Equal("[redacted]", redacted.OcrText[0].Text);
+    }
 }
 
 public sealed class CliTests
@@ -158,6 +174,64 @@ public sealed class CliTests
         Assert.Equal("safety-policy", doc.RootElement.GetProperty("data").GetProperty("method").GetString());
     }
 
+    [Theory]
+    [InlineData("see")]
+    [InlineData("image")]
+    [InlineData("click --id target")]
+    [InlineData("click --x 1 --y 2")]
+    [InlineData("type --text hi")]
+    [InlineData("press --key enter")]
+    [InlineData("hotkey --keys ctrl+s")]
+    [InlineData("scroll --delta 120")]
+    [InlineData("drag --from-x 1 --from-y 2 --to-x 3 --to-y 4")]
+    [InlineData("move --x 5 --y 6")]
+    [InlineData("set-value --id target --value abc")]
+    [InlineData("perform-action --id target --action invoke")]
+    [InlineData("window list")]
+    [InlineData("window focus --hwnd 1")]
+    [InlineData("window move --hwnd 1 --x 10 --y 20")]
+    [InlineData("window resize --hwnd 1 --width 100 --height 80")]
+    [InlineData("window set-bounds --hwnd 1 --x 1 --y 2 --width 3 --height 4")]
+    [InlineData("window minimize --hwnd 1")]
+    [InlineData("window maximize --hwnd 1")]
+    [InlineData("window restore --hwnd 1")]
+    [InlineData("window close --hwnd 1")]
+    [InlineData("app list")]
+    [InlineData("app launch --path fake.exe")]
+    [InlineData("app focus --name test")]
+    [InlineData("app switch --name test")]
+    [InlineData("app quit --name test")]
+    [InlineData("menu list")]
+    [InlineData("menu click --text File")]
+    [InlineData("dialog list")]
+    [InlineData("dialog click --button OK")]
+    [InlineData("dialog input --value hello")]
+    [InlineData("dialog dismiss")]
+    [InlineData("clipboard get")]
+    [InlineData("clipboard set --text hello")]
+    [InlineData("clipboard clear")]
+    [InlineData("clipboard paste")]
+    [InlineData("snapshot list")]
+    [InlineData("snapshot show --id missing")]
+    [InlineData("snapshot inspect --id missing --text nope")]
+    [InlineData("snapshot clean")]
+    [InlineData("config init")]
+    [InlineData("config show")]
+    [InlineData("config validate")]
+    [InlineData("config get --key snapshotDirectory")]
+    [InlineData("config set --key maxSnapshots --value 5")]
+    [InlineData("doctor")]
+    public async Task Cli_All_Commands_Return_Structured_Envelope(string commandLine)
+    {
+        var cli = TestCli();
+        var result = await cli.ExecuteAsync(commandLine.Split(' ', StringSplitOptions.RemoveEmptyEntries));
+        using var doc = JsonDocument.Parse(result.Json);
+
+        Assert.Equal(PbwSchema.Version, doc.RootElement.GetProperty("schemaVersion").GetString());
+        Assert.True(doc.RootElement.TryGetProperty("ok", out _));
+        Assert.True(doc.RootElement.TryGetProperty("data", out _) || doc.RootElement.TryGetProperty("error", out _));
+    }
+
     private static PbwCli TestCli()
     {
         var root = Path.Combine(Path.GetTempPath(), "pbw-tests", Guid.NewGuid().ToString("N"));
@@ -188,6 +262,19 @@ public sealed class McpTests
         Assert.Contains(tools, t => t.Name == "see");
         Assert.Contains(tools, t => t.Name == "window.list");
         Assert.Contains(tools, t => t.Name == "doctor");
+    }
+
+    [Fact]
+    public void Mcp_Tools_Expose_Command_Specific_Schemas()
+    {
+        var tools = new McpToolRegistry().ListTools();
+        var type = tools.Single(t => t.Name == "type");
+        var windowMove = tools.Single(t => t.Name == "window.move");
+
+        Assert.Contains("text", ((IReadOnlyDictionary<string, object?>)type.InputSchema["properties"]!).Keys);
+        Assert.False((bool)type.InputSchema["additionalProperties"]!);
+        Assert.Contains("hwnd", ((IReadOnlyDictionary<string, object?>)windowMove.InputSchema["properties"]!).Keys);
+        Assert.Contains("width", ((IReadOnlyDictionary<string, object?>)tools.Single(t => t.Name == "window.resize").InputSchema["properties"]!).Keys);
     }
 
     [Fact]
@@ -239,6 +326,109 @@ public sealed class WindowsIntegrationTests
         var service = new WindowsWindowService();
         var windows = service.ListWindows();
         Assert.NotNull(windows);
+    }
+}
+
+public sealed class WindowsRealApiIntegrationTests
+{
+    [Fact]
+    public async Task Wpf_TestHost_Exercises_Win32_Capture_And_UIAutomation_Patterns()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var hostExe = FindTestHostExe();
+        Assert.True(File.Exists(hostExe), $"Test host was not built: {hostExe}");
+        var outputPath = Path.Combine(Path.GetTempPath(), "pbw-testhost-" + Guid.NewGuid().ToString("N") + ".txt");
+        var startInfo = new ProcessStartInfo(hostExe)
+        {
+            UseShellExecute = false
+        };
+        startInfo.ArgumentList.Add(outputPath);
+        using var process = Process.Start(startInfo);
+        Assert.NotNull(process);
+
+        try
+        {
+            await WaitForAsync(() =>
+            {
+                process!.Refresh();
+                return process.MainWindowHandle != IntPtr.Zero;
+            }, TimeSpan.FromSeconds(10));
+
+            var handle = process!.MainWindowHandle.ToInt32();
+            var windowService = new WindowsWindowService();
+            var windows = windowService.ListWindows();
+            Assert.Contains(windows, w => w.Handle == handle && w.Title.StartsWith("pbw-integration-", StringComparison.Ordinal));
+
+            var automation = new WindowsElementAutomationService();
+            var set = automation.SetValue(new TargetSpec(AutomationId: "InputBox", WindowHandle: handle), "from-real-uia");
+            Assert.True(set.Performed, set.Message);
+            Assert.Equal("UIAutomation.ValuePattern", set.Method);
+
+            var invoke = automation.PerformAction(new TargetSpec(AutomationId: "WriteButton", WindowHandle: handle), "invoke");
+            Assert.True(invoke.Performed, invoke.Message);
+            Assert.Equal("UIAutomation.InvokePattern", invoke.Method);
+
+            await WaitForAsync(() => File.Exists(outputPath) && File.ReadAllText(outputPath) == "from-real-uia", TimeSpan.FromSeconds(5));
+
+            var capturePath = Path.Combine(Path.GetTempPath(), "pbw-capture-" + Guid.NewGuid().ToString("N") + ".bmp");
+            var capture = new WindowsCaptureService().CaptureWindow(handle, capturePath, automation.ReadTree());
+            Assert.True(capture.Success, capture.Message);
+            Assert.True(File.Exists(capturePath));
+            var header = File.ReadAllBytes(capturePath).Take(2).ToArray();
+            Assert.Equal(new byte[] { (byte)'B', (byte)'M' }, header);
+
+            var snapshotDir = Path.Combine(Path.GetTempPath(), "pbw-snapshot-" + Guid.NewGuid().ToString("N"));
+            var snapshot = await new WindowsSnapshotSource(windowService, automation, new WindowsCaptureService(), new WindowsOcrService(), snapshotDir)
+                .CaptureAsync(CancellationToken.None);
+            Assert.Equal(PbwSchema.Version, snapshot.SchemaVersion);
+            Assert.True(File.Exists(snapshot.ImagePath));
+            Assert.NotEmpty(snapshot.Windows);
+            Assert.NotEmpty(snapshot.Elements);
+        }
+        finally
+        {
+            if (process is { HasExited: false })
+            {
+                process.Kill(entireProcessTree: true);
+                await process.WaitForExitAsync();
+            }
+            if (File.Exists(outputPath)) File.Delete(outputPath);
+        }
+    }
+
+    private static string FindTestHostExe()
+    {
+        var current = new DirectoryInfo(AppContext.BaseDirectory);
+        while (current is not null && !File.Exists(Path.Combine(current.FullName, "pbw.sln")))
+        {
+            current = current.Parent;
+        }
+
+        var root = current?.FullName ?? Directory.GetCurrentDirectory();
+        return Path.Combine(root, "tests", "Pbw.TestHost", "bin", "Release", "net8.0-windows", "Pbw.TestHost.exe");
+    }
+
+    private static async Task WaitForAsync(Func<bool> condition, TimeSpan timeout)
+    {
+        var deadline = DateTimeOffset.UtcNow + timeout;
+        Exception? last = null;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            try
+            {
+                if (condition()) return;
+            }
+            catch (Exception ex)
+            {
+                last = ex;
+            }
+            await Task.Delay(100);
+        }
+        throw new TimeoutException(last is null ? "Condition was not met." : "Condition was not met: " + last.Message);
     }
 }
 

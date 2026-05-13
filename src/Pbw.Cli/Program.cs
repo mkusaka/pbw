@@ -11,7 +11,10 @@ public static class Program
     {
         var app = CreateDefaultApp();
         var result = await app.ExecuteAsync(args, CancellationToken.None).ConfigureAwait(false);
-        Console.Out.WriteLine(result.Json);
+        if (!string.IsNullOrEmpty(result.Json))
+        {
+            Console.Out.WriteLine(result.Json);
+        }
         return result.ExitCode;
     }
 
@@ -21,7 +24,7 @@ public static class Program
         var config = configLoader.Load();
         var windows = new WindowsWindowService();
         var automation = new WindowsElementAutomationService();
-        var snapshot = new WindowsSnapshotSource(windows, automation);
+        var snapshot = new WindowsSnapshotSource(windows, automation, new WindowsCaptureService(), new WindowsOcrService(), config.SnapshotDirectory);
         var store = new SnapshotStore(config.SnapshotDirectory);
         var input = new WindowsInputService();
         var router = new ActionRouter(input, automation, snapshot);
@@ -55,6 +58,7 @@ public sealed class PbwCli(
             }
 
             var output = await ExecuteObjectAsync(args, cancellationToken).ConfigureAwait(false);
+            if (output is NoOutput) return new CommandResult(0, "");
             return Ok(output);
         }
         catch (Exception ex)
@@ -134,6 +138,7 @@ public sealed class PbwCli(
     private async Task<object> See(CancellationToken cancellationToken)
     {
         var snapshot = await snapshotSource.CaptureAsync(cancellationToken).ConfigureAwait(false);
+        snapshot = new SnapshotRedactor(config.Redaction).Redact(snapshot);
         var path = snapshotStore.Save(snapshot);
         return new { snapshot = snapshot with { Metadata = Merge(snapshot.Metadata, "snapshotPath", path) } };
     }
@@ -141,6 +146,7 @@ public sealed class PbwCli(
     private async Task<object> Image(CancellationToken cancellationToken)
     {
         var snapshot = await snapshotSource.CaptureAsync(cancellationToken).ConfigureAwait(false);
+        snapshot = new SnapshotRedactor(config.Redaction).Redact(snapshot);
         snapshotStore.Save(snapshot);
         return new { snapshotId = snapshot.Id, imagePath = snapshot.ImagePath, status = snapshot.ImagePath is null ? "degraded" : "ok" };
     }
@@ -245,7 +251,7 @@ public sealed class PbwCli(
     {
         var server = new McpServer(new McpToolRegistry(), this);
         await server.RunStdioAsync(Console.In, Console.Out, cancellationToken).ConfigureAwait(false);
-        return new { status = "stopped" };
+        return new NoOutput();
     }
 
     private object InitConfig()
@@ -304,6 +310,8 @@ public sealed class PbwCli(
         return copy;
     }
 }
+
+internal sealed record NoOutput;
 
 internal static class Commands
 {
