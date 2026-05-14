@@ -41,3 +41,8 @@
 - Formatter/analyzer setup: added `.editorconfig`, repo-wide .NET analyzers, and CI formatting verification
 - GitHub Actions CI: added Windows workflow using `actions/checkout@v6` and `actions/setup-dotnet@v5`, with restore, format verify, Release build, and Release tests
 - `dotnet format --verify-no-changes --verbosity minimal`: passed
+- GitHub Actions workflow linting: CI now runs actionlint, pinact, ghalint, and the official zizmor action; all workflow `uses:` refs are pinned to full commit SHAs with version comments
+- `actionlint`: passed
+- `pinact run --check`: passed
+- `ghalint run`: passed
+- `zizmor --format=plain .`: passed, no findings reported
