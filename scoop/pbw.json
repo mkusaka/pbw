@@ -1,12 +1,12 @@
 {
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Windows-native desktop automation toolkit with a JSON CLI and MCP stdio server.",
   "homepage": "https://github.com/mkusaka/pbw",
   "license": "MIT",
   "architecture": {
     "64bit": {
-      "url": "https://github.com/mkusaka/pbw/releases/download/v0.1.0/pbw_0.1.0_windows_x64.zip",
-      "hash": "2186aa354d6eb51dbe5ea1ef91a636fb12c5747b8bfd65d7aaf0021aec17d2f0"
+      "url": "https://github.com/mkusaka/pbw/releases/download/v0.1.1/pbw_0.1.1_windows_x64.zip",
+      "hash": "bed03018cd6a6ba5075ddad195b46d3eb7237b1636c8050e6dc394e3fdbe6604"
     }
   },
   "bin": "pbw.exe",
