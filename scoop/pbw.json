@@ -6,7 +6,7 @@
   "architecture": {
     "64bit": {
       "url": "https://github.com/mkusaka/pbw/releases/download/v0.1.0/pbw_0.1.0_windows_x64.zip",
-      "hash": "af477de4735677f79d7a15459a98e43a039683c5f0aca75c721f02cd69959ec4"
+      "hash": "2186aa354d6eb51dbe5ea1ef91a636fb12c5747b8bfd65d7aaf0021aec17d2f0"
     }
   },
   "bin": "pbw.exe",
