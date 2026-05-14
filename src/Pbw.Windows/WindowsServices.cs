@@ -3,6 +3,13 @@ using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using Windows.Graphics.Capture;
+using Windows.Graphics.Imaging;
+using Windows.Graphics.DirectX;
+using Windows.Graphics.DirectX.Direct3D11;
+using Windows.Media.Ocr;
+using Windows.Storage;
+using Windows.Storage.Streams;
 using System.Windows.Automation;
 using Pbw.Core;
 
@@ -677,7 +684,38 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
 
 public sealed class WindowsOcrService : IWindowsOcrService
 {
-    public IReadOnlyList<OcrTextSnapshot> Recognize(string? imagePath) => Array.Empty<OcrTextSnapshot>();
+    public IReadOnlyList<OcrTextSnapshot> Recognize(string? imagePath)
+    {
+        if (string.IsNullOrWhiteSpace(imagePath) || !File.Exists(imagePath)) return Array.Empty<OcrTextSnapshot>();
+        try
+        {
+            var engine = OcrEngine.TryCreateFromUserProfileLanguages();
+            if (engine is null) return Array.Empty<OcrTextSnapshot>();
+
+            var file = StorageFile.GetFileFromPathAsync(imagePath).AsTask().GetAwaiter().GetResult();
+            using var stream = file.OpenReadAsync().AsTask().GetAwaiter().GetResult();
+            var decoder = BitmapDecoder.CreateAsync(stream).AsTask().GetAwaiter().GetResult();
+            using var bitmap = decoder.GetSoftwareBitmapAsync(BitmapPixelFormat.Bgra8, BitmapAlphaMode.Premultiplied)
+                .AsTask()
+                .GetAwaiter()
+                .GetResult();
+            var result = engine.RecognizeAsync(bitmap).AsTask().GetAwaiter().GetResult();
+            return result.Lines.SelectMany(line => line.Words)
+                .Select(word => new OcrTextSnapshot(
+                    word.Text,
+                    new Bounds(
+                        (int)Math.Round(word.BoundingRect.X),
+                        (int)Math.Round(word.BoundingRect.Y),
+                        (int)Math.Round(word.BoundingRect.Width),
+                        (int)Math.Round(word.BoundingRect.Height)),
+                    0))
+                .ToArray();
+        }
+        catch
+        {
+            return Array.Empty<OcrTextSnapshot>();
+        }
+    }
 }
 
 public sealed class WindowsCaptureService : IWindowsCaptureService
@@ -696,10 +734,137 @@ public sealed class WindowsCaptureService : IWindowsCaptureService
             return new CaptureResult(false, "PrintWindow", null, new Win32Exception(Marshal.GetLastWin32Error()).Message);
 
         var bounds = new Bounds(rect.Left, rect.Top, rect.Right - rect.Left, rect.Bottom - rect.Top);
+        var graphicsResult = TryCaptureWindowWithGraphicsCapture(new IntPtr(handle), imagePath);
+        if (graphicsResult.Success)
+        {
+            AnnotateBmp(imagePath, Flatten(elements).Select(e => e.Bounds), bounds);
+            return graphicsResult;
+        }
+
         var result = CaptureRegion(new IntPtr(handle), bounds, imagePath, "PrintWindow");
         if (!result.Success) result = CaptureRegion(IntPtr.Zero, bounds, imagePath, "BitBlt.desktop-crop");
         if (result.Success) AnnotateBmp(imagePath, Flatten(elements).Select(e => e.Bounds), bounds);
-        return result;
+        return result with { Message = graphicsResult.Message is null ? result.Message : "Windows.Graphics.Capture failed: " + graphicsResult.Message };
+    }
+
+    private static CaptureResult TryCaptureWindowWithGraphicsCapture(IntPtr hwnd, string path)
+    {
+        try
+        {
+            if (!GraphicsCaptureSession.IsSupported())
+                return new CaptureResult(false, "Windows.Graphics.Capture", null, "GraphicsCaptureSession is not supported.");
+
+            using var d3d = CreateDirect3DDevice();
+            var item = CreateCaptureItemForWindow(hwnd);
+            if (item is null || item.Size.Width <= 0 || item.Size.Height <= 0)
+                return new CaptureResult(false, "Windows.Graphics.Capture", null, "Could not create a GraphicsCaptureItem for the window.");
+
+            using var frameReady = new AutoResetEvent(false);
+            Direct3D11CaptureFrame? captured = null;
+            var framePool = Direct3D11CaptureFramePool.CreateFreeThreaded(
+                d3d.Device,
+                DirectXPixelFormat.B8G8R8A8UIntNormalized,
+                1,
+                item.Size);
+            var session = framePool.CreateCaptureSession(item);
+            framePool.FrameArrived += (sender, _) =>
+            {
+                try
+                {
+                    captured?.Dispose();
+                    captured = sender.TryGetNextFrame();
+                    frameReady.Set();
+                }
+                catch
+                {
+                    frameReady.Set();
+                }
+            };
+            session.StartCapture();
+            if (!frameReady.WaitOne(TimeSpan.FromSeconds(2)) || captured is null)
+                return new CaptureResult(false, "Windows.Graphics.Capture", null, "No capture frame arrived before timeout.");
+
+            SaveSurfaceAsBmp(captured.Surface, path);
+            return new CaptureResult(true, "Windows.Graphics.Capture", path);
+        }
+        catch (Exception ex)
+        {
+            return new CaptureResult(false, "Windows.Graphics.Capture", null, ex.Message);
+        }
+    }
+
+    private static void SaveSurfaceAsBmp(IDirect3DSurface surface, string path)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        var bitmap = SoftwareBitmap.CreateCopyFromSurfaceAsync(surface).AsTask().GetAwaiter().GetResult();
+        if (!File.Exists(path)) File.WriteAllBytes(path, Array.Empty<byte>());
+        var file = StorageFile.GetFileFromPathAsync(path).AsTask().GetAwaiter().GetResult();
+        var stream = file.OpenAsync(FileAccessMode.ReadWrite).AsTask().GetAwaiter().GetResult();
+        try
+        {
+            stream.Size = 0;
+            var encoder = BitmapEncoder.CreateAsync(BitmapEncoder.BmpEncoderId, stream).AsTask().GetAwaiter().GetResult();
+            encoder.SetSoftwareBitmap(bitmap);
+            encoder.FlushAsync().AsTask().GetAwaiter().GetResult();
+        }
+        finally
+        {
+            stream.Dispose();
+        }
+    }
+
+    private static GraphicsCaptureItem? CreateCaptureItemForWindow(IntPtr hwnd)
+    {
+        var className = "Windows.Graphics.Capture.GraphicsCaptureItem";
+        var hstring = IntPtr.Zero;
+        var factoryPtr = IntPtr.Zero;
+        try
+        {
+            var hrString = Native.WindowsCreateString(className, className.Length, out hstring);
+            if (hrString < 0) Marshal.ThrowExceptionForHR(hrString);
+            var interopIid = typeof(IGraphicsCaptureItemInterop).GUID;
+            var hrFactory = Native.RoGetActivationFactory(hstring, ref interopIid, out factoryPtr);
+            if (hrFactory < 0) Marshal.ThrowExceptionForHR(hrFactory);
+            var interop = (IGraphicsCaptureItemInterop)Marshal.GetObjectForIUnknown(factoryPtr);
+            var itemIid = new Guid("79C3F95B-31F7-4EC2-A464-632EF5D30760");
+            var itemPtr = interop.CreateForWindow(hwnd, ref itemIid);
+            if (itemPtr == IntPtr.Zero) return null;
+            try
+            {
+                return WinRT.MarshalInterface<GraphicsCaptureItem>.FromAbi(itemPtr);
+            }
+            finally
+            {
+                Marshal.Release(itemPtr);
+            }
+        }
+        finally
+        {
+            if (factoryPtr != IntPtr.Zero) Marshal.Release(factoryPtr);
+            if (hstring != IntPtr.Zero) Native.WindowsDeleteString(hstring);
+        }
+    }
+
+    private static Direct3DDeviceHandle CreateDirect3DDevice()
+    {
+        var hr = Native.D3D11CreateDevice(
+            IntPtr.Zero,
+            1,
+            IntPtr.Zero,
+            0x20,
+            null,
+            0,
+            7,
+            out var d3dDevice,
+            out _,
+            out var d3dContext);
+        if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+
+        var hr2 = Native.CreateDirect3D11DeviceFromDXGIDevice(d3dDevice, out var winRtDevice);
+        if (hr2 < 0) Marshal.ThrowExceptionForHR(hr2);
+        var device = WinRT.MarshalInterface<IDirect3DDevice>.FromAbi(winRtDevice);
+        Marshal.Release(winRtDevice);
+        return new Direct3DDeviceHandle(device, d3dDevice, d3dContext);
     }
 
     private static CaptureResult CaptureRegion(IntPtr hwnd, Bounds bounds, string path, string method)
@@ -770,6 +935,8 @@ public sealed class WindowsCaptureService : IWindowsCaptureService
         var width = BitConverter.ToInt32(bytes, 18);
         var height = Math.Abs(BitConverter.ToInt32(bytes, 22));
         var offset = BitConverter.ToInt32(bytes, 10);
+        var bitCount = BitConverter.ToInt16(bytes, 28);
+        if (bitCount != 32) return;
         foreach (var rect in rectangles.Take(120))
         {
             DrawRectangle(bytes, offset, width, height, new Bounds(rect.X - origin.X, rect.Y - origin.Y, rect.Width, rect.Height));
@@ -818,6 +985,26 @@ public sealed class WindowsCaptureService : IWindowsCaptureService
     }
 }
 
+internal sealed class Direct3DDeviceHandle(IDirect3DDevice device, IntPtr d3dDevice, IntPtr d3dContext) : IDisposable
+{
+    public IDirect3DDevice Device { get; } = device;
+
+    public void Dispose()
+    {
+        if (d3dContext != IntPtr.Zero) Marshal.Release(d3dContext);
+        if (d3dDevice != IntPtr.Zero) Marshal.Release(d3dDevice);
+    }
+}
+
+[ComImport]
+[Guid("3628E81B-3CAC-4C60-B7F4-23CE0E0C3356")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface IGraphicsCaptureItemInterop
+{
+    IntPtr CreateForWindow(IntPtr window, ref Guid iid);
+    IntPtr CreateForMonitor(IntPtr monitor, ref Guid iid);
+}
+
 public sealed class WindowsDoctorCheckService : IDoctorCheckService
 {
     public IReadOnlyList<DoctorCheck> RunChecks(PbwConfig config)
@@ -826,8 +1013,10 @@ public sealed class WindowsDoctorCheckService : IDoctorCheckService
         {
             new("os", RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "ok" : "warning", RuntimeInformation.OSDescription),
             new("uia", "ok", "UI Automation tree reading and common patterns are available."),
-            new("capture", "ok", "GDI desktop capture and BMP annotation are available; Windows.Graphics.Capture is not required for this build."),
-            new("ocr", "warning", "OCR service is a safe no-op when Windows OCR bindings are unavailable."),
+            new("capture", "ok", GraphicsCaptureSession.IsSupported()
+                ? "Windows.Graphics.Capture window capture is available; PrintWindow and BitBlt fallbacks are available."
+                : "Windows.Graphics.Capture is unavailable; PrintWindow and BitBlt fallbacks are available."),
+            new("ocr", OcrEngine.TryCreateFromUserProfileLanguages() is null ? "warning" : "ok", OcrEngine.TryCreateFromUserProfileLanguages() is null ? "Windows OCR engine is unavailable for the current user languages." : "Windows OCR engine is available."),
             new("dpi", "ok", "Coordinate converter uses display scale metadata.", new Dictionary<string, object?> { ["systemMetricsWidth"] = Native.GetSystemMetrics(0), ["systemMetricsHeight"] = Native.GetSystemMetrics(1) }),
             new("integrity", "ok", "Integrity level check is not elevated-specific in this build."),
             new("mcp", config.Mcp.StdioEnabled && !config.Mcp.RemoteListenerEnabled ? "ok" : "error", "MCP stdio transport configured; remote listener disabled.")
@@ -890,6 +1079,22 @@ internal static partial class Native
     [DllImport("gdi32.dll")] internal static extern bool DeleteDC(IntPtr hdc);
     [DllImport("gdi32.dll", SetLastError = true)] internal static extern bool BitBlt(IntPtr hdc, int x, int y, int cx, int cy, IntPtr hdcSrc, int x1, int y1, uint rop);
     [DllImport("gdi32.dll", SetLastError = true)] internal static extern int GetDIBits(IntPtr hdc, IntPtr hbm, uint start, uint cLines, byte[] lpvBits, ref BitmapInfo lpbmi, uint usage);
+    [DllImport("d3d11.dll", SetLastError = true)] internal static extern int D3D11CreateDevice(
+        IntPtr pAdapter,
+        int driverType,
+        IntPtr software,
+        uint flags,
+        int[]? featureLevels,
+        uint featureLevelsCount,
+        uint sdkVersion,
+        out IntPtr device,
+        out int featureLevel,
+        out IntPtr immediateContext);
+
+    [DllImport("d3d11.dll", SetLastError = true)] internal static extern int CreateDirect3D11DeviceFromDXGIDevice(IntPtr dxgiDevice, out IntPtr graphicsDevice);
+    [DllImport("combase.dll", SetLastError = true)] internal static extern int WindowsCreateString([MarshalAs(UnmanagedType.LPWStr)] string sourceString, int length, out IntPtr hstring);
+    [DllImport("combase.dll", SetLastError = true)] internal static extern int WindowsDeleteString(IntPtr hstring);
+    [DllImport("combase.dll", SetLastError = true)] internal static extern int RoGetActivationFactory(IntPtr activatableClassId, ref Guid iid, out IntPtr factory);
 }
 
 internal struct RECT

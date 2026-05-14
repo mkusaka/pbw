@@ -39,7 +39,19 @@ public static class Program
         AutomationProperties.SetName(button, "WriteButton");
         button.Click += (_, _) => File.WriteAllText(outputPath, input.Text);
 
+        var ocrText = new TextBlock
+        {
+            Text = "PBW OCR 12345",
+            FontSize = 32,
+            Margin = new Thickness(12),
+            Width = 360,
+            Height = 48
+        };
+        AutomationProperties.SetAutomationId(ocrText, "OcrText");
+        AutomationProperties.SetName(ocrText, "PBW OCR 12345");
+
         var panel = new StackPanel();
+        panel.Children.Add(ocrText);
         panel.Children.Add(input);
         panel.Children.Add(button);
 
@@ -47,7 +59,7 @@ public static class Program
         {
             Title = "pbw-integration-" + Environment.ProcessId,
             Width = 420,
-            Height = 180,
+            Height = 240,
             Content = panel,
             Topmost = false
         };

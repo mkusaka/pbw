@@ -1,5 +1,10 @@
 using System.Text.Json;
 using System.Diagnostics;
+using Windows.Graphics.Capture;
+using Windows.Media.Ocr;
+using System.Windows;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
 using Pbw.Cli;
 using Pbw.Core;
 using Pbw.Mcp;
@@ -377,6 +382,10 @@ public sealed class WindowsRealApiIntegrationTests
             var capturePath = Path.Combine(Path.GetTempPath(), "pbw-capture-" + Guid.NewGuid().ToString("N") + ".bmp");
             var capture = new WindowsCaptureService().CaptureWindow(handle, capturePath, automation.ReadTree());
             Assert.True(capture.Success, capture.Message);
+            if (GraphicsCaptureSession.IsSupported())
+            {
+                Assert.True(capture.Method == "Windows.Graphics.Capture", capture.Message ?? capture.Method);
+            }
             Assert.True(File.Exists(capturePath));
             var header = File.ReadAllBytes(capturePath).Take(2).ToArray();
             Assert.Equal(new byte[] { (byte)'B', (byte)'M' }, header);
@@ -400,6 +409,29 @@ public sealed class WindowsRealApiIntegrationTests
         }
     }
 
+    [Fact]
+    public void WindowsOcrService_Recognizes_Text_From_Controlled_Bmp()
+    {
+        if (!OperatingSystem.IsWindows() || OcrEngine.TryCreateFromUserProfileLanguages() is null)
+        {
+            return;
+        }
+
+        var path = Path.Combine(Path.GetTempPath(), "pbw-ocr-" + Guid.NewGuid().ToString("N") + ".bmp");
+        try
+        {
+            CreateTextBmp(path, "PBW OCR 12345");
+            var ocr = new WindowsOcrService().Recognize(path);
+            var text = string.Join(" ", ocr.Select(w => w.Text));
+            Assert.Contains("PBW", text, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("12345", text, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
     private static string FindTestHostExe()
     {
         var current = new DirectoryInfo(AppContext.BaseDirectory);
@@ -409,7 +441,7 @@ public sealed class WindowsRealApiIntegrationTests
         }
 
         var root = current?.FullName ?? Directory.GetCurrentDirectory();
-        return Path.Combine(root, "tests", "Pbw.TestHost", "bin", "Release", "net8.0-windows", "Pbw.TestHost.exe");
+        return Path.Combine(root, "tests", "Pbw.TestHost", "bin", "Release", "net8.0-windows10.0.22621.0", "Pbw.TestHost.exe");
     }
 
     private static async Task WaitForAsync(Func<bool> condition, TimeSpan timeout)
@@ -429,6 +461,31 @@ public sealed class WindowsRealApiIntegrationTests
             await Task.Delay(100);
         }
         throw new TimeoutException(last is null ? "Condition was not met." : "Condition was not met: " + last.Message);
+    }
+
+    private static void CreateTextBmp(string path, string text)
+    {
+        var visual = new DrawingVisual();
+        using (var drawing = visual.RenderOpen())
+        {
+            drawing.DrawRectangle(Brushes.White, null, new Rect(0, 0, 800, 220));
+            var formatted = new FormattedText(
+                text,
+                System.Globalization.CultureInfo.InvariantCulture,
+                FlowDirection.LeftToRight,
+                new Typeface("Arial"),
+                72,
+                Brushes.Black,
+                1.0);
+            drawing.DrawText(formatted, new Point(32, 56));
+        }
+
+        var bitmap = new RenderTargetBitmap(800, 220, 96, 96, PixelFormats.Pbgra32);
+        bitmap.Render(visual);
+        var encoder = new BmpBitmapEncoder();
+        encoder.Frames.Add(BitmapFrame.Create(bitmap));
+        using var stream = File.Create(path);
+        encoder.Save(stream);
     }
 }
 
