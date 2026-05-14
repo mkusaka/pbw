@@ -8,9 +8,18 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
+    <AssemblyName>pbw</AssemblyName>
     <TargetFramework>net8.0-windows10.0.22621.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <Version>0.1.0</Version>
+    <Authors>mkusaka</Authors>
+    <Company>mkusaka</Company>
+    <Product>pbw</Product>
+    <Description>Windows-native desktop automation toolkit.</Description>
+    <RepositoryUrl>https://github.com/mkusaka/pbw</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/mkusaka/pbw</PackageProjectUrl>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
   </PropertyGroup>
 
 </Project>

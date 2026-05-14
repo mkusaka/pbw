@@ -46,3 +46,7 @@
 - `pinact run --check`: passed
 - `ghalint run`: passed
 - `zizmor --format=plain .`: passed, no findings reported
+- Release packaging: added a tag-triggered GitHub Release workflow and `scripts/package.ps1` for Windows x64 self-contained ZIPs
+- Scoop support: added `scoop/pbw.json` for installing the GitHub Release ZIP directly
+- `scripts/package.ps1 -Version 0.1.0`: passed, produced `pbw_0.1.0_windows_x64.zip`
+- Release ZIP smoke test: passed, extracted `pbw.exe --help` returned structured JSON
