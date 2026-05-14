@@ -1,7 +1,5 @@
-using System.Text.Json;
 using System.Diagnostics;
-using Windows.Graphics.Capture;
-using Windows.Media.Ocr;
+using System.Text.Json;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
@@ -9,7 +7,8 @@ using Pbw.Cli;
 using Pbw.Core;
 using Pbw.Mcp;
 using Pbw.Windows;
-using Xunit;
+using Windows.Graphics.Capture;
+using Windows.Media.Ocr;
 
 namespace Pbw.Tests;
 

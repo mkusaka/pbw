@@ -38,3 +38,6 @@
 - `pbw see`: passed, created a JSON snapshot and annotated BMP image using Windows.Graphics.Capture monitor capture; OCR returned text on this host
 - Windows.Graphics.Capture integration: passed against a real WPF window
 - Windows OCR integration: passed against a controlled BMP with rendered text
+- Formatter/analyzer setup: added `.editorconfig`, repo-wide .NET analyzers, and CI formatting verification
+- GitHub Actions CI: added Windows workflow using `actions/checkout@v6` and `actions/setup-dotnet@v5`, with restore, format verify, Release build, and Release tests
+- `dotnet format --verify-no-changes --verbosity minimal`: passed

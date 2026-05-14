@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
@@ -501,7 +500,7 @@ public static class ArgParser
                 value = key[(equals + 1)..];
                 key = key[..equals];
             }
-            else if (i + 1 < args.Count && !args[i + 1].StartsWith("-", StringComparison.Ordinal))
+            else if (i + 1 < args.Count && !args[i + 1].StartsWith('-'))
             {
                 value = args[++i];
             }

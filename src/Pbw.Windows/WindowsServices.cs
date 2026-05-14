@@ -3,15 +3,14 @@ using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
-using Windows.Graphics.Capture;
-using Windows.Graphics.Imaging;
-using Windows.Graphics.DirectX;
-using Windows.Graphics.DirectX.Direct3D11;
-using Windows.Media.Ocr;
-using Windows.Storage;
-using Windows.Storage.Streams;
 using System.Windows.Automation;
 using Pbw.Core;
+using Windows.Graphics.Capture;
+using Windows.Graphics.DirectX;
+using Windows.Graphics.DirectX.Direct3D11;
+using Windows.Graphics.Imaging;
+using Windows.Media.Ocr;
+using Windows.Storage;
 
 namespace Pbw.Windows;
 
@@ -1152,7 +1151,8 @@ internal static partial class Native
     [DllImport("gdi32.dll")] internal static extern bool DeleteDC(IntPtr hdc);
     [DllImport("gdi32.dll", SetLastError = true)] internal static extern bool BitBlt(IntPtr hdc, int x, int y, int cx, int cy, IntPtr hdcSrc, int x1, int y1, uint rop);
     [DllImport("gdi32.dll", SetLastError = true)] internal static extern int GetDIBits(IntPtr hdc, IntPtr hbm, uint start, uint cLines, byte[] lpvBits, ref BitmapInfo lpbmi, uint usage);
-    [DllImport("d3d11.dll", SetLastError = true)] internal static extern int D3D11CreateDevice(
+    [DllImport("d3d11.dll", SetLastError = true)]
+    internal static extern int D3D11CreateDevice(
         IntPtr pAdapter,
         int driverType,
         IntPtr software,

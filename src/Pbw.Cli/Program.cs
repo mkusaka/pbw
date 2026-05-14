@@ -100,7 +100,7 @@ public sealed class PbwCli(
             "click" => await router.ClickAsync(TargetSpec.FromArgs(tail), cancellationToken).ConfigureAwait(false),
             "type" => input.TypeText(Required(options, "text")),
             "press" => input.Press(Required(options, "key")),
-            "hotkey" => input.Hotkey((options.GetValueOrDefault("keys") ?? string.Join("+", tail.Where(a => !a.StartsWith("--")))).Split('+', StringSplitOptions.RemoveEmptyEntries)),
+            "hotkey" => input.Hotkey((options.GetValueOrDefault("keys") ?? string.Join("+", tail.Where(a => !a.StartsWith("--", StringComparison.Ordinal)))).Split('+', StringSplitOptions.RemoveEmptyEntries)),
             "scroll" => input.Scroll(Int(options, "delta", 120), ArgParser.Int(options, "x"), ArgParser.Int(options, "y")),
             "drag" => input.Drag(Int(options, "from-x"), Int(options, "from-y"), Int(options, "to-x"), Int(options, "to-y")),
             "move" => input.Move(Int(options, "x"), Int(options, "y")),
@@ -122,7 +122,7 @@ public sealed class PbwCli(
     private void EnforceToolPolicy(string command, IReadOnlyList<string> tail)
     {
         var tool = command is "window" or "app" or "menu" or "dialog" or "clipboard" or "snapshot" or "config"
-            ? command + "." + (tail.FirstOrDefault(a => !a.StartsWith("--")) ?? "")
+            ? command + "." + (tail.FirstOrDefault(a => !a.StartsWith("--", StringComparison.Ordinal)) ?? "")
             : command;
         if (config.Safety.DenyTools.Any(t => t.Equals(tool, StringComparison.OrdinalIgnoreCase) || t.Equals(command, StringComparison.OrdinalIgnoreCase)))
         {
@@ -293,7 +293,7 @@ public sealed class PbwCli(
     }
 
     private static CommandResult Ok(object? data) => new(0, JsonSerializer.Serialize(PbwEnvelope<object?>.Success(data), PbwSchema.Json));
-    private static string Sub(IReadOnlyList<string> tail) => tail.FirstOrDefault(a => !a.StartsWith("--")) ?? throw new ArgumentException("Subcommand is required.");
+    private static string Sub(IReadOnlyList<string> tail) => tail.FirstOrDefault(a => !a.StartsWith("--", StringComparison.Ordinal)) ?? throw new ArgumentException("Subcommand is required.");
     private static string Required(IReadOnlyDictionary<string, string> options, string key) => options.TryGetValue(key, out var value) ? value : throw new ArgumentException($"--{key} is required.");
     private static int Int(IReadOnlyDictionary<string, string> options, string key, int? fallback = null) => ArgParser.Int(options, key) ?? fallback ?? throw new ArgumentException($"--{key} is required and must be an integer.");
     private static Bounds Bounds(IReadOnlyDictionary<string, string> options) => new(Int(options, "x"), Int(options, "y"), Int(options, "width"), Int(options, "height"));
