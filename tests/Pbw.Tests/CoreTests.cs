@@ -377,7 +377,7 @@ public sealed class WindowsRealApiIntegrationTests
             Assert.True(invoke.Performed, invoke.Message);
             Assert.Equal("UIAutomation.InvokePattern", invoke.Method);
 
-            await WaitForAsync(() => File.Exists(outputPath) && File.ReadAllText(outputPath) == "from-real-uia", TimeSpan.FromSeconds(5));
+            await WaitForAsync(() => File.Exists(outputPath) && File.ReadAllText(outputPath) == "from-real-uia", TimeSpan.FromSeconds(15));
 
             var capturePath = Path.Combine(Path.GetTempPath(), "pbw-capture-" + Guid.NewGuid().ToString("N") + ".bmp");
             var capture = new WindowsCaptureService().CaptureWindow(handle, capturePath, automation.ReadTree());

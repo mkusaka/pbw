@@ -723,9 +723,16 @@ public sealed class WindowsCaptureService : IWindowsCaptureService
     public CaptureResult CaptureDesktop(string imagePath, IReadOnlyList<WindowSnapshot> windows, IReadOnlyList<ElementSnapshot> elements)
     {
         var bounds = new Bounds(0, 0, Native.GetSystemMetrics(0), Native.GetSystemMetrics(1));
+        var graphicsResult = TryCapturePrimaryMonitorWithGraphicsCapture(imagePath);
+        if (graphicsResult.Success)
+        {
+            AnnotateBmp(imagePath, windows.Select(w => w.Bounds).Concat(Flatten(elements).Select(e => e.Bounds)), bounds);
+            return graphicsResult;
+        }
+
         var result = CaptureRegion(IntPtr.Zero, bounds, imagePath, "BitBlt.desktop");
         if (result.Success) AnnotateBmp(imagePath, windows.Select(w => w.Bounds).Concat(Flatten(elements).Select(e => e.Bounds)), bounds);
-        return result;
+        return result with { Message = graphicsResult.Message is null ? result.Message : "Windows.Graphics.Capture monitor failed: " + graphicsResult.Message };
     }
 
     public CaptureResult CaptureWindow(int handle, string imagePath, IReadOnlyList<ElementSnapshot> elements)
@@ -756,13 +763,46 @@ public sealed class WindowsCaptureService : IWindowsCaptureService
 
             using var d3d = CreateDirect3DDevice();
             var item = CreateCaptureItemForWindow(hwnd);
+            return CaptureGraphicsItem(item, d3d.Device, path);
+        }
+        catch (Exception ex)
+        {
+            return new CaptureResult(false, "Windows.Graphics.Capture", null, ex.Message);
+        }
+    }
+
+    private static CaptureResult TryCapturePrimaryMonitorWithGraphicsCapture(string path)
+    {
+        try
+        {
+            if (!GraphicsCaptureSession.IsSupported())
+                return new CaptureResult(false, "Windows.Graphics.Capture", null, "GraphicsCaptureSession is not supported.");
+
+            var monitor = Native.MonitorFromPoint(new POINT { X = 0, Y = 0 }, 1);
+            if (monitor == IntPtr.Zero)
+                return new CaptureResult(false, "Windows.Graphics.Capture", null, "Primary monitor handle was not found.");
+
+            using var d3d = CreateDirect3DDevice();
+            var item = CreateCaptureItemForMonitor(monitor);
+            return CaptureGraphicsItem(item, d3d.Device, path);
+        }
+        catch (Exception ex)
+        {
+            return new CaptureResult(false, "Windows.Graphics.Capture", null, ex.Message);
+        }
+    }
+
+    private static CaptureResult CaptureGraphicsItem(GraphicsCaptureItem? item, IDirect3DDevice device, string path)
+    {
+        try
+        {
             if (item is null || item.Size.Width <= 0 || item.Size.Height <= 0)
-                return new CaptureResult(false, "Windows.Graphics.Capture", null, "Could not create a GraphicsCaptureItem for the window.");
+                return new CaptureResult(false, "Windows.Graphics.Capture", null, "Could not create a valid GraphicsCaptureItem.");
 
             using var frameReady = new AutoResetEvent(false);
             Direct3D11CaptureFrame? captured = null;
             var framePool = Direct3D11CaptureFramePool.CreateFreeThreaded(
-                d3d.Device,
+                device,
                 DirectXPixelFormat.B8G8R8A8UIntNormalized,
                 1,
                 item.Size);
@@ -828,6 +868,38 @@ public sealed class WindowsCaptureService : IWindowsCaptureService
             var interop = (IGraphicsCaptureItemInterop)Marshal.GetObjectForIUnknown(factoryPtr);
             var itemIid = new Guid("79C3F95B-31F7-4EC2-A464-632EF5D30760");
             var itemPtr = interop.CreateForWindow(hwnd, ref itemIid);
+            if (itemPtr == IntPtr.Zero) return null;
+            try
+            {
+                return WinRT.MarshalInterface<GraphicsCaptureItem>.FromAbi(itemPtr);
+            }
+            finally
+            {
+                Marshal.Release(itemPtr);
+            }
+        }
+        finally
+        {
+            if (factoryPtr != IntPtr.Zero) Marshal.Release(factoryPtr);
+            if (hstring != IntPtr.Zero) Native.WindowsDeleteString(hstring);
+        }
+    }
+
+    private static GraphicsCaptureItem? CreateCaptureItemForMonitor(IntPtr monitor)
+    {
+        var className = "Windows.Graphics.Capture.GraphicsCaptureItem";
+        var hstring = IntPtr.Zero;
+        var factoryPtr = IntPtr.Zero;
+        try
+        {
+            var hrString = Native.WindowsCreateString(className, className.Length, out hstring);
+            if (hrString < 0) Marshal.ThrowExceptionForHR(hrString);
+            var interopIid = typeof(IGraphicsCaptureItemInterop).GUID;
+            var hrFactory = Native.RoGetActivationFactory(hstring, ref interopIid, out factoryPtr);
+            if (hrFactory < 0) Marshal.ThrowExceptionForHR(hrFactory);
+            var interop = (IGraphicsCaptureItemInterop)Marshal.GetObjectForIUnknown(factoryPtr);
+            var itemIid = new Guid("79C3F95B-31F7-4EC2-A464-632EF5D30760");
+            var itemPtr = interop.CreateForMonitor(monitor, ref itemIid);
             if (itemPtr == IntPtr.Zero) return null;
             try
             {
@@ -1057,6 +1129,7 @@ internal static partial class Native
     [DllImport("user32.dll", SetLastError = true)] internal static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll")] internal static extern int GetSystemMetrics(int nIndex);
     [DllImport("user32.dll")] internal static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] internal static extern IntPtr MonitorFromPoint(POINT pt, uint dwFlags);
     [DllImport("user32.dll")] internal static extern void mouse_event(int dwFlags, int dx, int dy, int dwData, UIntPtr dwExtraInfo);
     [DllImport("user32.dll")] internal static extern void keybd_event(byte bVk, byte bScan, int dwFlags, UIntPtr dwExtraInfo);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] internal static extern short VkKeyScan(char ch);
@@ -1103,6 +1176,12 @@ internal struct RECT
     public int Top;
     public int Right;
     public int Bottom;
+}
+
+internal struct POINT
+{
+    public int X;
+    public int Y;
 }
 
 [StructLayout(LayoutKind.Sequential)]
