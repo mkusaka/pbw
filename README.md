@@ -31,3 +31,12 @@ dotnet run --project src/Pbw.Cli -- see
 ```
 
 All commands return structured JSON envelopes with `schemaVersion`.
+
+## Agent Skill
+
+This repository includes a pbw agent skill at `skills/pbw`. To use it in an agent project, copy that directory into the client's skill directory, for example:
+
+```powershell
+New-Item -ItemType Directory -Force .claude\skills\pbw | Out-Null
+Copy-Item -Recurse -Force .\skills\pbw\* .claude\skills\pbw\
+```

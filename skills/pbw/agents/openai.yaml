@@ -1,0 +1,6 @@
+interface:
+  display_name: "pbw"
+  short_description: "Windows desktop automation with pbw"
+  default_prompt: "Use $pbw to inspect and automate a local Windows desktop task with structured JSON output."
+policy:
+  allow_implicit_invocation: true
