@@ -34,7 +34,25 @@ All commands return structured JSON envelopes with `schemaVersion`.
 
 ## Agent Skill
 
-This repository includes a pbw agent skill at `skills/pbw`. To use it in an agent project, copy that directory into the client's skill directory, for example:
+This repository includes a pbw agent skill at `skills/pbw`. The easiest install path is the universal skills installer:
+
+```powershell
+npx --yes skills add mkusaka/pbw --skill pbw -y
+```
+
+For a global install, add `-g`:
+
+```powershell
+npx --yes skills add mkusaka/pbw --skill pbw -g -y
+```
+
+To inspect the skills exposed by the repository without installing:
+
+```powershell
+npx --yes skills add mkusaka/pbw --list
+```
+
+To install manually in an agent project, copy that directory into the client's skill directory, for example:
 
 ```powershell
 New-Item -ItemType Directory -Force .claude\skills\pbw | Out-Null
