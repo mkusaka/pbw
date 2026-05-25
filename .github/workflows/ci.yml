@@ -13,7 +13,7 @@ permissions:
 
 env:
   ACTIONLINT_VERSION: 1.7.12
-  PINACT_VERSION: 3.10.1
+  PINACT_VERSION: 4.0.0
   GHALINT_VERSION: 1.5.6
 
 jobs:
