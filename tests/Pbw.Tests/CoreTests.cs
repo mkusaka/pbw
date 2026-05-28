@@ -45,11 +45,46 @@ public sealed class CoreTests
         var automation = new FakeAutomation();
         var router = new ActionRouter(new FakeInput(), automation, new FakeSnapshotSource());
 
-        var result = await router.ClickAsync(new TargetSpec(Id: "target"));
+        var result = await router.ClickAsync(new TargetSpec(Id: "target"), InputDispatchMode.Background);
 
         Assert.True(result.Performed);
         Assert.Equal("UIAutomation", result.Method);
         Assert.Equal("invoke", automation.LastAction);
+        Assert.NotNull(result.Details);
+        Assert.Equal("background", result.Details!["dispatch"]);
+        Assert.Equal("semantic", result.Details["actualDispatch"]);
+        Assert.True((bool)result.Details["semantic"]!);
+    }
+
+    [Fact]
+    public async Task ActionRouter_Passes_Dispatch_To_Input_Fallback()
+    {
+        var input = new FakeInput();
+        var router = new ActionRouter(input, new FakeAutomation(), new FakeSnapshotSource());
+
+        var result = await router.ClickAsync(new TargetSpec(X: 11, Y: 22, WindowHandle: 1234), InputDispatchMode.Foreground);
+
+        Assert.True(result.Performed);
+        Assert.Equal(InputDispatchMode.Foreground, input.LastDispatch);
+        Assert.Equal(1234, input.LastWindowHandle);
+    }
+
+    [Theory]
+    [InlineData(null, InputDispatchMode.Auto)]
+    [InlineData("", InputDispatchMode.Auto)]
+    [InlineData("auto", InputDispatchMode.Auto)]
+    [InlineData("background", InputDispatchMode.Background)]
+    [InlineData("foreground", InputDispatchMode.Foreground)]
+    public void InputDispatchPolicy_Parses_And_Defaults(string? value, InputDispatchMode expected)
+    {
+        Assert.Equal(expected, InputDispatchPolicy.Parse(value));
+    }
+
+    [Fact]
+    public void InputDispatchPolicy_Rejects_Unknown_Mode()
+    {
+        var ex = Assert.Throws<ArgumentException>(() => InputDispatchPolicy.Parse("silent"));
+        Assert.Contains("Unsupported dispatch mode", ex.Message);
     }
 
     [Fact]
@@ -352,6 +387,115 @@ public sealed class CaptureDiagnosticsTests
     }
 }
 
+public sealed class WindowsInputDispatchTests
+{
+    [Fact]
+    public void WindowsInputService_Background_Click_Posts_Messages_Without_Foreground()
+    {
+        var backend = new FakeWin32InputBackend
+        {
+            Foreground = new IntPtr(0x10),
+            WindowAtPoint = new IntPtr(0x100),
+            RootWindow = new IntPtr(0x100),
+            ChildWindow = new IntPtr(0x200),
+            ClassName = "Button"
+        };
+        var service = new WindowsInputService(backend);
+
+        var result = service.Click(50, 60, dispatch: InputDispatchMode.Background);
+
+        Assert.True(result.Performed);
+        Assert.Equal("Win32.PostMessage", result.Method);
+        Assert.Empty(backend.SetForegroundCalls);
+        Assert.Empty(backend.MouseEvents);
+        Assert.True(backend.Posts.Count >= 3);
+        Assert.NotNull(result.Details);
+        Assert.Equal("background", result.Details!["dispatch"]);
+        Assert.Equal("background", result.Details["actualDispatch"]);
+        Assert.Equal("mouse_click", result.Details["eventKind"]);
+        Assert.False((bool)result.Details["foregroundChanged"]!);
+    }
+
+    [Fact]
+    public void WindowsInputService_Background_Click_Returns_Structured_BackgroundUnavailable_For_Known_Drop()
+    {
+        var backend = new FakeWin32InputBackend
+        {
+            WindowAtPoint = new IntPtr(0x100),
+            RootWindow = new IntPtr(0x100),
+            ClassName = "Chrome_WidgetWin_1"
+        };
+        var service = new WindowsInputService(backend);
+
+        var ex = Assert.Throws<PbwException>(() => service.Click(10, 20, dispatch: InputDispatchMode.Background));
+
+        Assert.Equal("background_unavailable", ex.Error.Code);
+        Assert.NotNull(ex.Error.Details);
+        Assert.Equal("Chrome_WidgetWin_1", ex.Error.Details!["targetClass"]);
+        Assert.Equal("mouse_click", ex.Error.Details["eventKind"]);
+        Assert.Empty(backend.Posts);
+        Assert.Empty(backend.MouseEvents);
+    }
+
+    [Fact]
+    public void WindowsInputService_Auto_Falls_Back_To_Foreground_With_Details_When_Background_Drops()
+    {
+        var backend = new FakeWin32InputBackend
+        {
+            Foreground = new IntPtr(0x10),
+            WindowAtPoint = new IntPtr(0x100),
+            RootWindow = new IntPtr(0x100),
+            ClassName = "Chrome_WidgetWin_1"
+        };
+        var service = new WindowsInputService(backend);
+
+        var result = service.Click(10, 20);
+
+        Assert.True(result.Performed);
+        Assert.Equal("Win32Input.foreground", result.Method);
+        Assert.NotNull(result.Details);
+        Assert.Equal("auto", result.Details!["dispatch"]);
+        Assert.Equal("foreground", result.Details["actualDispatch"]);
+        Assert.True(result.Details.ContainsKey("backgroundFallback"));
+        Assert.Contains(new IntPtr(0x100), backend.SetForegroundCalls);
+        Assert.Contains(new IntPtr(0x10), backend.SetForegroundCalls);
+        Assert.NotEmpty(backend.MouseEvents);
+    }
+
+    [Fact]
+    public void WindowsInputService_Background_Type_Posts_WmChar_To_Hwnd()
+    {
+        var backend = new FakeWin32InputBackend
+        {
+            RootWindow = new IntPtr(0x100),
+            ClassName = "Edit"
+        };
+        var service = new WindowsInputService(backend);
+
+        var result = service.TypeText("ab", InputDispatchMode.Background, 0x100);
+
+        Assert.True(result.Performed);
+        Assert.Equal("Win32.PostMessage", result.Method);
+        Assert.Equal(2, backend.Posts.Count(p => p.Message == 0x0102));
+        Assert.NotNull(result.Details);
+        Assert.Equal("text_input", result.Details!["eventKind"]);
+    }
+
+    [Fact]
+    public void WindowsInputService_Background_Type_Without_Hwnd_Does_Not_Send_Foreground_Input()
+    {
+        var backend = new FakeWin32InputBackend();
+        var service = new WindowsInputService(backend);
+
+        var ex = Assert.Throws<PbwException>(() => service.TypeText("hi", InputDispatchMode.Background));
+
+        Assert.Equal("background_unavailable", ex.Error.Code);
+        Assert.Empty(backend.Posts);
+        Assert.Empty(backend.KeyEvents);
+        Assert.Equal("background", ex.Error.Details!["dispatch"]);
+    }
+}
+
 public sealed class CliTests
 {
     [Fact]
@@ -387,6 +531,113 @@ public sealed class CliTests
         Assert.NotEqual(0, result.ExitCode);
         Assert.False(doc.RootElement.GetProperty("ok").GetBoolean());
         Assert.Equal("invalid_argument", doc.RootElement.GetProperty("error").GetProperty("code").GetString());
+    }
+
+    [Fact]
+    public async Task Cli_Click_Help_Returns_Command_Usage_Without_Input()
+    {
+        var input = new FakeInput();
+        var cli = TestCli(input);
+        var result = await cli.ExecuteAsync(new[] { "click", "--help" });
+        using var doc = JsonDocument.Parse(result.Json);
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.True(doc.RootElement.GetProperty("ok").GetBoolean());
+        Assert.Equal("click", doc.RootElement.GetProperty("data").GetProperty("command").GetString());
+        Assert.Contains("--dispatch", doc.RootElement.GetProperty("data").GetProperty("usage").GetString());
+        Assert.Null(input.LastDispatch);
+    }
+
+    [Fact]
+    public async Task Cli_Type_Text_Help_Executes_Input_Command()
+    {
+        var input = new FakeInput();
+        var cli = TestCli(input);
+        var result = await cli.ExecuteAsync(new[] { "type", "--text", "help" });
+        using var doc = JsonDocument.Parse(result.Json);
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.True(doc.RootElement.GetProperty("ok").GetBoolean());
+        var data = doc.RootElement.GetProperty("data");
+        Assert.False(data.TryGetProperty("command", out _));
+        Assert.Equal("type", data.GetProperty("action").GetString());
+        Assert.Equal("fake", data.GetProperty("method").GetString());
+        Assert.Equal(4, data.GetProperty("details").GetProperty("length").GetInt32());
+        Assert.Equal(InputDispatchMode.Auto, input.LastDispatch);
+    }
+
+    [Fact]
+    public async Task Cli_Hotkey_Keys_Help_Executes_Input_Command()
+    {
+        var input = new FakeInput();
+        var cli = TestCli(input);
+        var result = await cli.ExecuteAsync(new[] { "hotkey", "--keys", "help" });
+        using var doc = JsonDocument.Parse(result.Json);
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.True(doc.RootElement.GetProperty("ok").GetBoolean());
+        var data = doc.RootElement.GetProperty("data");
+        Assert.False(data.TryGetProperty("command", out _));
+        Assert.Equal("hotkey", data.GetProperty("action").GetString());
+        Assert.Equal("help", data.GetProperty("details").GetProperty("keys")[0].GetString());
+        Assert.Equal(InputDispatchMode.Auto, input.LastDispatch);
+    }
+
+    [Fact]
+    public async Task Cli_CommandExecutor_Type_Text_Help_Executes_Input_Command()
+    {
+        var input = new FakeInput();
+        var cli = TestCli(input);
+        var envelope = await cli.ExecuteAsync(
+            "type",
+            new Dictionary<string, object?> { ["text"] = "help" },
+            CancellationToken.None);
+        var json = JsonSerializer.Serialize(envelope.Data, PbwSchema.Json);
+        using var doc = JsonDocument.Parse(json);
+
+        Assert.True(envelope.Ok);
+        Assert.False(doc.RootElement.TryGetProperty("command", out _));
+        Assert.Equal("type", doc.RootElement.GetProperty("action").GetString());
+        Assert.Equal(4, doc.RootElement.GetProperty("details").GetProperty("length").GetInt32());
+        Assert.Equal(InputDispatchMode.Auto, input.LastDispatch);
+    }
+
+    [Fact]
+    public async Task Cli_Input_Dispatch_Option_Is_Returned_In_Json_Details()
+    {
+        var cli = TestCli();
+        var result = await cli.ExecuteAsync(new[] { "type", "--text", "hi", "--hwnd", "42", "--dispatch", "foreground" });
+        using var doc = JsonDocument.Parse(result.Json);
+
+        Assert.Equal(0, result.ExitCode);
+        var details = doc.RootElement.GetProperty("data").GetProperty("details");
+        Assert.Equal("foreground", details.GetProperty("dispatch").GetString());
+        Assert.Equal(42, details.GetProperty("hwnd").GetInt32());
+    }
+
+    [Fact]
+    public async Task Cli_Invalid_Dispatch_Returns_Structured_Error()
+    {
+        var cli = TestCli();
+        var result = await cli.ExecuteAsync(new[] { "click", "--x", "1", "--y", "2", "--dispatch", "silent" });
+        using var doc = JsonDocument.Parse(result.Json);
+
+        Assert.Equal(2, result.ExitCode);
+        Assert.False(doc.RootElement.GetProperty("ok").GetBoolean());
+        Assert.Equal("invalid_argument", doc.RootElement.GetProperty("error").GetProperty("code").GetString());
+    }
+
+    [Fact]
+    public async Task Cli_BackgroundUnavailable_Returns_Structured_Error()
+    {
+        var cli = TestCli(new FakeInput { ThrowBackgroundUnavailable = true });
+        var result = await cli.ExecuteAsync(new[] { "type", "--text", "hi", "--dispatch", "background" });
+        using var doc = JsonDocument.Parse(result.Json);
+
+        Assert.Equal(1, result.ExitCode);
+        Assert.False(doc.RootElement.GetProperty("ok").GetBoolean());
+        Assert.Equal("background_unavailable", doc.RootElement.GetProperty("error").GetProperty("code").GetString());
+        Assert.Equal("background", doc.RootElement.GetProperty("error").GetProperty("details").GetProperty("dispatch").GetString());
     }
 
     [Fact]
@@ -459,19 +710,20 @@ public sealed class CliTests
         Assert.True(doc.RootElement.TryGetProperty("data", out _) || doc.RootElement.TryGetProperty("error", out _));
     }
 
-    private static PbwCli TestCli()
+    private static PbwCli TestCli(IInputService? input = null)
     {
         var root = Path.Combine(Path.GetTempPath(), "pbw-tests", Guid.NewGuid().ToString("N"));
         var config = PbwConfig.Defaults(root);
         var source = new FakeSnapshotSource();
         var automation = new FakeAutomation();
+        input ??= new FakeInput();
         return new PbwCli(
             new ConfigLoader(Path.Combine(root, "config.json")),
             config,
             source,
             new SnapshotStore(config.SnapshotDirectory),
-            new FakeInput(),
-            new ActionRouter(new FakeInput(), automation, source),
+            input,
+            new ActionRouter(input, automation, source),
             new FakeWindowService(),
             new FakeAppService(),
             new FakeClipboard(),
@@ -496,9 +748,15 @@ public sealed class McpTests
     {
         var tools = new McpToolRegistry().ListTools();
         var type = tools.Single(t => t.Name == "type");
+        var click = tools.Single(t => t.Name == "click");
         var windowMove = tools.Single(t => t.Name == "window.move");
 
-        Assert.Contains("text", ((IReadOnlyDictionary<string, object?>)type.InputSchema["properties"]!).Keys);
+        var typeProperties = (IReadOnlyDictionary<string, object?>)type.InputSchema["properties"]!;
+        var clickProperties = (IReadOnlyDictionary<string, object?>)click.InputSchema["properties"]!;
+        Assert.Contains("text", typeProperties.Keys);
+        Assert.Contains("dispatch", typeProperties.Keys);
+        Assert.Contains("hwnd", typeProperties.Keys);
+        Assert.Contains("dispatch", clickProperties.Keys);
         Assert.False((bool)type.InputSchema["additionalProperties"]!);
         Assert.Contains("hwnd", ((IReadOnlyDictionary<string, object?>)windowMove.InputSchema["properties"]!).Keys);
         Assert.Contains("width", ((IReadOnlyDictionary<string, object?>)tools.Single(t => t.Name == "window.resize").InputSchema["properties"]!).Keys);
@@ -525,6 +783,40 @@ public sealed class McpTests
         Assert.False(doc.RootElement.GetProperty("result").GetProperty("isError").GetBoolean());
         var text = doc.RootElement.GetProperty("result").GetProperty("content")[0].GetProperty("text").GetString();
         Assert.Contains(PbwSchema.Version, text);
+    }
+
+    [Fact]
+    public async Task Mcp_Tool_Call_Forwards_Dispatch_Field()
+    {
+        var executor = new FakeExecutor();
+        var server = new McpServer(new McpToolRegistry(), executor);
+
+        await server.HandleJsonRpcAsync("""{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"type","arguments":{"text":"hi","dispatch":"background","hwnd":42}}}""");
+
+        Assert.Equal("type", executor.LastCommand);
+        Assert.NotNull(executor.LastArguments);
+        Assert.Equal("background", executor.LastArguments!["dispatch"]?.ToString());
+        var hwnd = Assert.IsType<JsonElement>(executor.LastArguments["hwnd"]);
+        Assert.Equal(42, hwnd.GetInt32());
+    }
+
+    [Fact]
+    public async Task Mcp_Tool_Call_Returns_BackgroundUnavailable_Error()
+    {
+        var error = new PbwError(
+            "background_unavailable",
+            "Background dispatch unavailable in fake executor.",
+            "type",
+            new Dictionary<string, object?> { ["dispatch"] = "background" });
+        var server = new McpServer(new McpToolRegistry(), new FakeExecutor(PbwEnvelope<object?>.Failure(error)));
+
+        var json = await server.HandleJsonRpcAsync("""{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"type","arguments":{"text":"hi","dispatch":"background"}}}""");
+        using var doc = JsonDocument.Parse(json);
+
+        Assert.True(doc.RootElement.GetProperty("result").GetProperty("isError").GetBoolean());
+        var text = doc.RootElement.GetProperty("result").GetProperty("content")[0].GetProperty("text").GetString();
+        Assert.Contains("background_unavailable", text);
+        Assert.Contains("background", text);
     }
 
     [Fact]
@@ -589,6 +881,10 @@ public sealed class WindowsRealApiIntegrationTests
             var windowService = new WindowsWindowService();
             var windows = windowService.ListWindows();
             Assert.Contains(windows, w => w.Handle == handle && w.Title.StartsWith("pbw-integration-", StringComparison.Ordinal));
+
+            var backgroundDrag = Assert.Throws<PbwException>(() => new WindowsInputService().Drag(10, 10, 40, 40, InputDispatchMode.Background, handle));
+            Assert.Equal("background_unavailable", backgroundDrag.Error.Code);
+            Assert.Equal("background", backgroundDrag.Error.Details!["dispatch"]);
 
             var automation = new WindowsElementAutomationService();
             var set = automation.SetValue(new TargetSpec(AutomationId: "InputBox", WindowHandle: handle), "from-real-uia");
@@ -747,14 +1043,104 @@ internal sealed class FakeSnapshotSource : ISnapshotSource
 
 internal sealed class FakeInput : IInputService
 {
-    public ActionResult Click(int x, int y, string button = "left") => new("click", true, "fake", Details: new Dictionary<string, object?> { ["x"] = x, ["y"] = y });
-    public ActionResult Move(int x, int y) => new("move", true, "fake");
-    public ActionResult TypeText(string text) => new("type", true, "fake");
-    public ActionResult Press(string key) => new("press", true, "fake");
-    public ActionResult Hotkey(IReadOnlyList<string> keys) => new("hotkey", true, "fake");
-    public ActionResult Scroll(int delta, int? x = null, int? y = null) => new("scroll", true, "fake");
-    public ActionResult Drag(int fromX, int fromY, int toX, int toY) => new("drag", true, "fake");
+    public InputDispatchMode? LastDispatch { get; private set; }
+    public int? LastWindowHandle { get; private set; }
+    public bool ThrowBackgroundUnavailable { get; init; }
+
+    public ActionResult Click(int x, int y, string button = "left", InputDispatchMode dispatch = InputDispatchMode.Auto, int? windowHandle = null) =>
+        Result("click", dispatch, windowHandle, new Dictionary<string, object?> { ["x"] = x, ["y"] = y, ["button"] = button });
+
+    public ActionResult Move(int x, int y, InputDispatchMode dispatch = InputDispatchMode.Auto, int? windowHandle = null) =>
+        Result("move", dispatch, windowHandle, new Dictionary<string, object?> { ["x"] = x, ["y"] = y });
+
+    public ActionResult TypeText(string text, InputDispatchMode dispatch = InputDispatchMode.Auto, int? windowHandle = null) =>
+        Result("type", dispatch, windowHandle, new Dictionary<string, object?> { ["length"] = text.Length });
+
+    public ActionResult Press(string key, InputDispatchMode dispatch = InputDispatchMode.Auto, int? windowHandle = null) =>
+        Result("press", dispatch, windowHandle, new Dictionary<string, object?> { ["key"] = key });
+
+    public ActionResult Hotkey(IReadOnlyList<string> keys, InputDispatchMode dispatch = InputDispatchMode.Auto, int? windowHandle = null) =>
+        Result("hotkey", dispatch, windowHandle, new Dictionary<string, object?> { ["keys"] = keys });
+
+    public ActionResult Scroll(int delta, int? x = null, int? y = null, InputDispatchMode dispatch = InputDispatchMode.Auto, int? windowHandle = null) =>
+        Result("scroll", dispatch, windowHandle, new Dictionary<string, object?> { ["delta"] = delta, ["x"] = x, ["y"] = y });
+
+    public ActionResult Drag(int fromX, int fromY, int toX, int toY, InputDispatchMode dispatch = InputDispatchMode.Auto, int? windowHandle = null) =>
+        Result("drag", dispatch, windowHandle, new Dictionary<string, object?> { ["fromX"] = fromX, ["fromY"] = fromY, ["toX"] = toX, ["toY"] = toY });
+
+    private ActionResult Result(string action, InputDispatchMode dispatch, int? windowHandle, Dictionary<string, object?> details)
+    {
+        LastDispatch = dispatch;
+        LastWindowHandle = windowHandle;
+        details["dispatch"] = InputDispatchPolicy.ToWireString(dispatch);
+        details["hwnd"] = windowHandle;
+        if (ThrowBackgroundUnavailable)
+        {
+            throw new PbwException(new PbwError("background_unavailable", "Background dispatch unavailable in fake input.", action, details));
+        }
+
+        return new(action, true, "fake", Details: details);
+    }
 }
+
+internal sealed class FakeWin32InputBackend : IWin32InputBackend
+{
+    public IntPtr Foreground { get; set; }
+    public IntPtr WindowAtPoint { get; set; }
+    public IntPtr RootWindow { get; set; }
+    public IntPtr ChildWindow { get; set; }
+    public string ClassName { get; set; } = "Window";
+    public List<IntPtr> SetForegroundCalls { get; } = new();
+    public List<(int Flags, int Dx, int Dy, int Data)> MouseEvents { get; } = new();
+    public List<(byte VirtualKey, byte ScanCode, int Flags)> KeyEvents { get; } = new();
+    public List<PostMessageCall> Posts { get; } = new();
+
+    public IntPtr GetForegroundWindow() => Foreground;
+
+    public bool SetForegroundWindow(IntPtr hwnd)
+    {
+        SetForegroundCalls.Add(hwnd);
+        Foreground = hwnd;
+        return true;
+    }
+
+    public bool SetCursorPos(int x, int y) => true;
+
+    public void MouseEvent(int flags, int dx, int dy, int data, UIntPtr extraInfo) =>
+        MouseEvents.Add((flags, dx, dy, data));
+
+    public void KeybdEvent(byte virtualKey, byte scanCode, int flags, UIntPtr extraInfo) =>
+        KeyEvents.Add((virtualKey, scanCode, flags));
+
+    public short VkKeyScan(char character) => (short)char.ToUpperInvariant(character);
+
+    public uint MapVirtualKey(uint code, uint mapType) => code;
+
+    public IntPtr WindowFromPoint(int x, int y) => WindowAtPoint;
+
+    public IntPtr GetRootWindow(IntPtr hwnd) => RootWindow == IntPtr.Zero ? hwnd : RootWindow;
+
+    public bool IsWindow(IntPtr hwnd) => hwnd != IntPtr.Zero;
+
+    public string GetClassName(IntPtr hwnd) => ClassName;
+
+    public bool ScreenToClient(IntPtr hwnd, ref int x, ref int y) => true;
+
+    public IntPtr ChildWindowFromPointEx(IntPtr hwnd, int x, int y, uint flags) =>
+        ChildWindow == IntPtr.Zero ? hwnd : ChildWindow;
+
+    public bool IsChild(IntPtr parent, IntPtr child) => true;
+
+    public bool PostMessage(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam)
+    {
+        Posts.Add(new PostMessageCall(hwnd, message, wParam, lParam));
+        return true;
+    }
+
+    public string LastErrorMessage() => "fake Win32 error";
+}
+
+internal sealed record PostMessageCall(IntPtr Hwnd, uint Message, IntPtr WParam, IntPtr LParam);
 
 internal sealed class FakeAutomation : IElementAutomationService
 {
@@ -833,8 +1219,15 @@ internal static class TestEnvironment
     public static bool HasInteractiveDesktop() => OperatingSystem.IsWindows() && Environment.UserInteractive;
 }
 
-internal sealed class FakeExecutor : IPbwCommandExecutor
+internal sealed class FakeExecutor(PbwEnvelope<object?>? response = null) : IPbwCommandExecutor
 {
-    public Task<PbwEnvelope<object?>> ExecuteAsync(string command, IReadOnlyDictionary<string, object?> arguments, CancellationToken cancellationToken) =>
-        Task.FromResult(PbwEnvelope<object?>.Success(new { command }));
+    public string? LastCommand { get; private set; }
+    public IReadOnlyDictionary<string, object?>? LastArguments { get; private set; }
+
+    public Task<PbwEnvelope<object?>> ExecuteAsync(string command, IReadOnlyDictionary<string, object?> arguments, CancellationToken cancellationToken)
+    {
+        LastCommand = command;
+        LastArguments = arguments;
+        return Task.FromResult(response ?? PbwEnvelope<object?>.Success(new { command }));
+    }
 }

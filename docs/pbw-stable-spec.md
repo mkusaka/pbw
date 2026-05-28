@@ -51,6 +51,30 @@ The CLI supports:
 
 Every command returns a structured success envelope or structured error envelope.
 
+## Input Dispatch Policy
+
+Input commands (`click`, `type`, `press`, `hotkey`, `scroll`, `drag`, and `move`)
+accept an optional `dispatch` mode through both CLI (`--dispatch`) and MCP tool
+schemas. Supported values are:
+
+- `auto`: the default. Semantic UI Automation actions are preferred for element
+  targets. Win32 background message dispatch is attempted where it is likely to
+  work, with foreground/global fallback only where the command path allows the
+  existing behavior.
+- `background`: never steals foreground. If pbw cannot safely resolve or deliver
+  background input, the command fails with structured error code
+  `background_unavailable`.
+- `foreground`: explicitly allows foreground/global input. Result details report
+  the requested dispatch, actual dispatch, target HWND where known, whether
+  foreground changed, whether restore was attempted, and whether restore
+  succeeded.
+
+Background fallback diagnostics are additive `details` fields and do not change
+the `pbw.stable.v1` envelope. Consumers must ignore unknown action result
+details. Known dispatch detail keys include `dispatch`, `actualDispatch`,
+`eventKind`, `targetHwnd`, `rootHwnd`, `targetClass`, `foregroundChanged`,
+`foregroundRestored`, and optional `backgroundFallback`.
+
 ## Snapshot Model
 
 Snapshots contain:
@@ -85,11 +109,15 @@ The Windows layer should prefer native APIs in this order:
 
 1. UI Automation patterns for semantic actions.
 2. Win32 window/app/clipboard services for shell integration.
-3. `SendInput`-style input fallback.
-4. Capture through Windows Graphics Capture where feasible, `PrintWindow`, then desktop crop fallback.
-5. OCR through Windows OCR where feasible, with a safe degraded no-op fallback.
+3. Background Win32 message dispatch where feasible and safe for input commands.
+4. Explicit foreground/global input fallback when requested or required by the command path.
+5. Capture through Windows Graphics Capture where feasible, `PrintWindow`, then desktop crop fallback.
+6. OCR through Windows OCR where feasible, with a safe degraded no-op fallback.
 
 Unavailable capabilities must be reported through structured degraded results rather than raw exceptions.
+Background input that cannot be delivered safely is reported as
+`background_unavailable` with a reason and retry hint instead of silently sending
+foreground/global input.
 Window capture should use DWM extended frame bounds for visual capture/crop
 bounds when available, then fall back to Win32 window rectangles. BMP captures
 are checked for all-black or mostly-black output before accepting a backend.

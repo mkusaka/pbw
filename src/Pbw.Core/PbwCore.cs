@@ -118,6 +118,63 @@ public sealed record ActionResult(
     string? Message = null,
     IReadOnlyDictionary<string, object?>? Details = null);
 
+public enum InputDispatchMode
+{
+    Auto,
+    Background,
+    Foreground
+}
+
+public enum InputEventKind
+{
+    MouseClick,
+    MouseMove,
+    MouseScroll,
+    Keystroke,
+    KeyCombo,
+    TextInput,
+    MouseDrag
+}
+
+public static class InputDispatchPolicy
+{
+    public static InputDispatchMode Parse(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return InputDispatchMode.Auto;
+        }
+
+        return value.Trim().ToLowerInvariant() switch
+        {
+            "auto" => InputDispatchMode.Auto,
+            "background" => InputDispatchMode.Background,
+            "foreground" => InputDispatchMode.Foreground,
+            _ => throw new ArgumentException($"Unsupported dispatch mode '{value}'. Expected auto, background, or foreground.")
+        };
+    }
+
+    public static string ToWireString(InputDispatchMode mode) => mode switch
+    {
+        InputDispatchMode.Auto => "auto",
+        InputDispatchMode.Background => "background",
+        InputDispatchMode.Foreground => "foreground",
+        _ => mode.ToString().ToLowerInvariant()
+    };
+
+    public static string ToWireString(InputEventKind kind) => kind switch
+    {
+        InputEventKind.MouseClick => "mouse_click",
+        InputEventKind.MouseMove => "mouse_move",
+        InputEventKind.MouseScroll => "mouse_scroll",
+        InputEventKind.Keystroke => "keystroke",
+        InputEventKind.KeyCombo => "key_combo",
+        InputEventKind.TextInput => "text_input",
+        InputEventKind.MouseDrag => "mouse_drag",
+        _ => kind.ToString().ToLowerInvariant()
+    };
+}
+
 public sealed record CommandResult(int ExitCode, string Json);
 
 public sealed record PbwConfig(
@@ -263,13 +320,13 @@ public interface IClipboardService
 
 public interface IInputService
 {
-    ActionResult Click(int x, int y, string button = "left");
-    ActionResult Move(int x, int y);
-    ActionResult TypeText(string text);
-    ActionResult Press(string key);
-    ActionResult Hotkey(IReadOnlyList<string> keys);
-    ActionResult Scroll(int delta, int? x = null, int? y = null);
-    ActionResult Drag(int fromX, int fromY, int toX, int toY);
+    ActionResult Click(int x, int y, string button = "left", InputDispatchMode dispatch = InputDispatchMode.Auto, int? windowHandle = null);
+    ActionResult Move(int x, int y, InputDispatchMode dispatch = InputDispatchMode.Auto, int? windowHandle = null);
+    ActionResult TypeText(string text, InputDispatchMode dispatch = InputDispatchMode.Auto, int? windowHandle = null);
+    ActionResult Press(string key, InputDispatchMode dispatch = InputDispatchMode.Auto, int? windowHandle = null);
+    ActionResult Hotkey(IReadOnlyList<string> keys, InputDispatchMode dispatch = InputDispatchMode.Auto, int? windowHandle = null);
+    ActionResult Scroll(int delta, int? x = null, int? y = null, InputDispatchMode dispatch = InputDispatchMode.Auto, int? windowHandle = null);
+    ActionResult Drag(int fromX, int fromY, int toX, int toY, InputDispatchMode dispatch = InputDispatchMode.Auto, int? windowHandle = null);
 }
 
 public interface IElementAutomationService
@@ -469,18 +526,34 @@ public sealed class ActionRouter(
     IElementAutomationService automation,
     ISnapshotSource snapshotSource)
 {
-    public async Task<ActionResult> ClickAsync(TargetSpec target, CancellationToken cancellationToken = default)
+    public async Task<ActionResult> ClickAsync(TargetSpec target, InputDispatchMode dispatch = InputDispatchMode.Auto, CancellationToken cancellationToken = default)
     {
-        if (target.X is not null && target.Y is not null) return input.Click(target.X.Value, target.Y.Value);
+        if (target.X is not null && target.Y is not null)
+        {
+            return input.Click(target.X.Value, target.Y.Value, dispatch: dispatch, windowHandle: target.WindowHandle);
+        }
+
         var element = await new TargetResolver(snapshotSource).ResolveAsync(target, cancellationToken).ConfigureAwait(false);
         if (element is null) throw new PbwException(new PbwError("target_not_found", "No element matched the target.", target.ToString()));
         if (element.Patterns?.Any(p => p.Equals("Invoke", StringComparison.OrdinalIgnoreCase)) == true)
-            return automation.PerformAction(target, "invoke");
-        return input.Click(element.Bounds.CenterX, element.Bounds.CenterY);
+        {
+            return WithDispatchDetails(automation.PerformAction(target, "invoke"), dispatch, semantic: true);
+        }
+
+        return input.Click(element.Bounds.CenterX, element.Bounds.CenterY, dispatch: dispatch, windowHandle: target.WindowHandle);
     }
 
     public ActionResult SetValue(TargetSpec target, string value) => automation.SetValue(target, value);
     public ActionResult PerformAction(TargetSpec target, string action) => automation.PerformAction(target, action);
+
+    private static ActionResult WithDispatchDetails(ActionResult result, InputDispatchMode dispatch, bool semantic)
+    {
+        var details = result.Details is null ? new Dictionary<string, object?>() : new Dictionary<string, object?>(result.Details);
+        details["dispatch"] = InputDispatchPolicy.ToWireString(dispatch);
+        details["actualDispatch"] = "semantic";
+        details["semantic"] = semantic;
+        return result with { Details = details };
+    }
 }
 
 public static class ArgParser
@@ -511,4 +584,7 @@ public static class ArgParser
 
     public static int? Int(IReadOnlyDictionary<string, string> map, string key) =>
         map.TryGetValue(key, out var value) && int.TryParse(value, out var i) ? i : null;
+
+    public static InputDispatchMode Dispatch(IReadOnlyDictionary<string, string> map, string key = "dispatch") =>
+        InputDispatchPolicy.Parse(map.GetValueOrDefault(key));
 }

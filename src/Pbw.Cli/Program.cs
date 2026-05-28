@@ -92,18 +92,24 @@ public sealed class PbwCli(
         var command = args[0];
         var tail = args.Skip(1).ToArray();
         var options = ArgParser.ParseOptions(tail);
+        if (IsHelpRequest(tail))
+        {
+            return CommandHelp(command);
+        }
+
         EnforceToolPolicy(command, tail);
+        var dispatch = IsInputCommand(command) ? ArgParser.Dispatch(options) : InputDispatchMode.Auto;
         return command switch
         {
             "see" => await See(cancellationToken).ConfigureAwait(false),
             "image" => await Image(cancellationToken).ConfigureAwait(false),
-            "click" => await router.ClickAsync(TargetSpec.FromArgs(tail), cancellationToken).ConfigureAwait(false),
-            "type" => input.TypeText(Required(options, "text")),
-            "press" => input.Press(Required(options, "key")),
-            "hotkey" => input.Hotkey((options.GetValueOrDefault("keys") ?? string.Join("+", tail.Where(a => !a.StartsWith("--", StringComparison.Ordinal)))).Split('+', StringSplitOptions.RemoveEmptyEntries)),
-            "scroll" => input.Scroll(Int(options, "delta", 120), ArgParser.Int(options, "x"), ArgParser.Int(options, "y")),
-            "drag" => input.Drag(Int(options, "from-x"), Int(options, "from-y"), Int(options, "to-x"), Int(options, "to-y")),
-            "move" => input.Move(Int(options, "x"), Int(options, "y")),
+            "click" => await router.ClickAsync(TargetSpec.FromArgs(tail), dispatch, cancellationToken).ConfigureAwait(false),
+            "type" => input.TypeText(Required(options, "text"), dispatch, ArgParser.Int(options, "hwnd")),
+            "press" => input.Press(Required(options, "key"), dispatch, ArgParser.Int(options, "hwnd")),
+            "hotkey" => input.Hotkey((options.GetValueOrDefault("keys") ?? string.Join("+", tail.TakeWhile(a => !a.StartsWith("--", StringComparison.Ordinal)))).Split('+', StringSplitOptions.RemoveEmptyEntries), dispatch, ArgParser.Int(options, "hwnd")),
+            "scroll" => input.Scroll(Int(options, "delta", 120), ArgParser.Int(options, "x"), ArgParser.Int(options, "y"), dispatch, ArgParser.Int(options, "hwnd")),
+            "drag" => input.Drag(Int(options, "from-x"), Int(options, "from-y"), Int(options, "to-x"), Int(options, "to-y"), dispatch, ArgParser.Int(options, "hwnd")),
+            "move" => input.Move(Int(options, "x"), Int(options, "y"), dispatch, ArgParser.Int(options, "hwnd")),
             "set-value" => router.SetValue(TargetSpec.FromArgs(tail), Required(options, "value")),
             "perform-action" => router.PerformAction(TargetSpec.FromArgs(tail), options.GetValueOrDefault("action") ?? "invoke"),
             "window" => Window(tail, options),
@@ -116,6 +122,77 @@ public sealed class PbwCli(
             "doctor" => new { checks = doctor.RunChecks(config) },
             "mcp" => await RunMcp(cancellationToken).ConfigureAwait(false),
             _ => throw new ArgumentException($"Unknown command '{command}'.")
+        };
+    }
+
+    private static bool IsInputCommand(string command) =>
+        command is "click" or "type" or "press" or "hotkey" or "scroll" or "drag" or "move";
+
+    private static bool IsHelpRequest(IReadOnlyList<string> tail) =>
+        tail.Any(IsHelpFlag) || tail is ["help"];
+
+    private static bool IsHelpFlag(string value) => value is "-h" or "--help";
+
+    private static object CommandHelp(string command)
+    {
+        var dispatch = new
+        {
+            name = "--dispatch",
+            values = new[] { "auto", "background", "foreground" },
+            @default = "auto",
+            description = "Input dispatch mode. auto is the default; background refuses foreground fallback; foreground explicitly allows global input."
+        };
+        var hwnd = new
+        {
+            name = "--hwnd",
+            description = "Optional target window handle for background dispatch or explicit foreground targeting."
+        };
+
+        return command switch
+        {
+            "click" => new
+            {
+                command,
+                usage = "pbw click [--id ID|--text TEXT|--automation-id ID|--x X --y Y] [--hwnd HWND] [--dispatch auto|background|foreground]",
+                options = new object[] { dispatch, hwnd }
+            },
+            "type" => new
+            {
+                command,
+                usage = "pbw type --text TEXT [--hwnd HWND] [--dispatch auto|background|foreground]",
+                options = new object[] { dispatch, hwnd }
+            },
+            "press" => new
+            {
+                command,
+                usage = "pbw press --key KEY [--hwnd HWND] [--dispatch auto|background|foreground]",
+                options = new object[] { dispatch, hwnd }
+            },
+            "hotkey" => new
+            {
+                command,
+                usage = "pbw hotkey --keys ctrl+s [--hwnd HWND] [--dispatch auto|background|foreground]",
+                options = new object[] { dispatch, hwnd }
+            },
+            "scroll" => new
+            {
+                command,
+                usage = "pbw scroll [--delta 120] [--x X --y Y] [--hwnd HWND] [--dispatch auto|background|foreground]",
+                options = new object[] { dispatch, hwnd }
+            },
+            "drag" => new
+            {
+                command,
+                usage = "pbw drag --from-x X --from-y Y --to-x X --to-y Y [--hwnd HWND] [--dispatch auto|background|foreground]",
+                options = new object[] { dispatch, hwnd }
+            },
+            "move" => new
+            {
+                command,
+                usage = "pbw move --x X --y Y [--hwnd HWND] [--dispatch auto|background|foreground]",
+                options = new object[] { dispatch, hwnd }
+            },
+            _ => new { commands = Commands.All, usage = "pbw <command> [options]", schemaVersion = PbwSchema.Version }
         };
     }
 

@@ -48,6 +48,10 @@ dotnet run --project src/Pbw.Cli -- see
 
 All commands return structured JSON envelopes with `schemaVersion`.
 
+Input commands (`click`, `type`, `press`, `hotkey`, `scroll`, `drag`, and `move`)
+accept `--dispatch auto|background|foreground`; command-specific help such as
+`dotnet run --project src/Pbw.Cli -- click --help` shows the current options.
+
 ## Agent Skill
 
 This repository includes a pbw agent skill at `skills/pbw`. The easiest install path is the universal skills installer:

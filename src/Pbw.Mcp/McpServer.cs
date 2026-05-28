@@ -27,6 +27,16 @@ public sealed class McpToolRegistry
             properties[key] = new Dictionary<string, object?> { ["type"] = type };
             if (isRequired) required.Add(key);
         }
+        void AddDispatch()
+        {
+            properties["dispatch"] = new Dictionary<string, object?>
+            {
+                ["type"] = "string",
+                ["enum"] = new[] { "auto", "background", "foreground" },
+                ["default"] = "auto",
+                ["description"] = "Input dispatch mode. auto is the default; background refuses foreground fallback and returns background_unavailable when needed; foreground explicitly allows foreground/global input."
+            };
+        }
 
         if (name is "click" or "set-value" or "perform-action" or "menu.list" or "dialog.click" or "dialog.input" or "dialog.dismiss" or "snapshot.inspect")
         {
@@ -38,6 +48,16 @@ public sealed class McpToolRegistry
             Add("y", "integer");
             Add("hwnd", "integer");
             Add("index", "integer");
+        }
+
+        if (name is "type" or "press" or "hotkey" or "scroll" or "drag" or "move")
+        {
+            Add("hwnd", "integer");
+        }
+
+        if (name is "click" or "type" or "press" or "hotkey" or "scroll" or "drag" or "move")
+        {
+            AddDispatch();
         }
 
         switch (name)

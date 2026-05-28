@@ -468,93 +468,750 @@ public sealed class WindowsClipboardService : IClipboardService
     }
 }
 
+public interface IWin32InputBackend
+{
+    IntPtr GetForegroundWindow();
+    bool SetForegroundWindow(IntPtr hwnd);
+    bool SetCursorPos(int x, int y);
+    void MouseEvent(int flags, int dx, int dy, int data, UIntPtr extraInfo);
+    void KeybdEvent(byte virtualKey, byte scanCode, int flags, UIntPtr extraInfo);
+    short VkKeyScan(char character);
+    uint MapVirtualKey(uint code, uint mapType);
+    IntPtr WindowFromPoint(int x, int y);
+    IntPtr GetRootWindow(IntPtr hwnd);
+    bool IsWindow(IntPtr hwnd);
+    string GetClassName(IntPtr hwnd);
+    bool ScreenToClient(IntPtr hwnd, ref int x, ref int y);
+    IntPtr ChildWindowFromPointEx(IntPtr hwnd, int x, int y, uint flags);
+    bool IsChild(IntPtr parent, IntPtr child);
+    bool PostMessage(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
+    string LastErrorMessage();
+}
+
+public sealed class NativeWin32InputBackend : IWin32InputBackend
+{
+    public IntPtr GetForegroundWindow() => Native.GetForegroundWindow();
+    public bool SetForegroundWindow(IntPtr hwnd) => Native.SetForegroundWindow(hwnd);
+    public bool SetCursorPos(int x, int y) => Native.SetCursorPos(x, y);
+    public void MouseEvent(int flags, int dx, int dy, int data, UIntPtr extraInfo) => Native.mouse_event(flags, dx, dy, data, extraInfo);
+    public void KeybdEvent(byte virtualKey, byte scanCode, int flags, UIntPtr extraInfo) => Native.keybd_event(virtualKey, scanCode, flags, extraInfo);
+    public short VkKeyScan(char character) => Native.VkKeyScan(character);
+    public uint MapVirtualKey(uint code, uint mapType) => Native.MapVirtualKey(code, mapType);
+    public IntPtr WindowFromPoint(int x, int y) => Native.WindowFromPoint(new POINT { X = x, Y = y });
+    public IntPtr GetRootWindow(IntPtr hwnd)
+    {
+        var root = Native.GetAncestor(hwnd, Native.GaRoot);
+        return root == IntPtr.Zero ? hwnd : root;
+    }
+
+    public bool IsWindow(IntPtr hwnd) => Native.IsWindow(hwnd);
+    public string GetClassName(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero)
+        {
+            return "<unknown>";
+        }
+
+        var sb = new StringBuilder(256);
+        var length = Native.GetClassName(hwnd, sb, sb.Capacity);
+        return length <= 0 ? "<unknown>" : sb.ToString();
+    }
+
+    public bool ScreenToClient(IntPtr hwnd, ref int x, ref int y)
+    {
+        var point = new POINT { X = x, Y = y };
+        var ok = Native.ScreenToClient(hwnd, ref point);
+        x = point.X;
+        y = point.Y;
+        return ok;
+    }
+
+    public IntPtr ChildWindowFromPointEx(IntPtr hwnd, int x, int y, uint flags) =>
+        Native.ChildWindowFromPointEx(hwnd, new POINT { X = x, Y = y }, flags);
+
+    public bool IsChild(IntPtr parent, IntPtr child) => Native.IsChild(parent, child);
+    public bool PostMessage(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam) => Native.PostMessage(hwnd, message, wParam, lParam);
+    public string LastErrorMessage() => new Win32Exception(Marshal.GetLastWin32Error()).Message;
+}
+
 public sealed class WindowsInputService : IInputService
 {
-    public ActionResult Click(int x, int y, string button = "left")
+    private const uint WmMouseMove = 0x0200;
+    private const uint WmLButtonDown = 0x0201;
+    private const uint WmLButtonUp = 0x0202;
+    private const uint WmRButtonDown = 0x0204;
+    private const uint WmRButtonUp = 0x0205;
+    private const uint WmMButtonDown = 0x0207;
+    private const uint WmMButtonUp = 0x0208;
+    private const uint WmMouseWheel = 0x020A;
+    private const uint WmKeyDown = 0x0100;
+    private const uint WmKeyUp = 0x0101;
+    private const uint WmChar = 0x0102;
+    private const int KeyEventUp = 0x0002;
+    private const int MouseEventLeftDown = 0x0002;
+    private const int MouseEventLeftUp = 0x0004;
+    private const int MouseEventRightDown = 0x0008;
+    private const int MouseEventRightUp = 0x0010;
+    private const int MouseEventMiddleDown = 0x0020;
+    private const int MouseEventMiddleUp = 0x0040;
+    private const int MouseEventWheel = 0x0800;
+    private const uint ChildWindowSkipInvisibleDisabledTransparent = 0x0001 | 0x0002 | 0x0004;
+    private const ushort MkLeftButton = 0x0001;
+    private const ushort MkRightButton = 0x0002;
+    private const ushort MkMiddleButton = 0x0010;
+
+    private readonly IWin32InputBackend backend;
+
+    public WindowsInputService(IWin32InputBackend? backend = null)
     {
-        Native.SetCursorPos(x, y);
-        var (down, up) = button.Equals("right", StringComparison.OrdinalIgnoreCase) ? (0x0008, 0x0010) : (0x0002, 0x0004);
-        Native.mouse_event(down, 0, 0, 0, UIntPtr.Zero);
-        Native.mouse_event(up, 0, 0, 0, UIntPtr.Zero);
-        return new("click", true, "Win32Input", Details: new Dictionary<string, object?> { ["x"] = x, ["y"] = y, ["button"] = button });
+        this.backend = backend ?? new NativeWin32InputBackend();
     }
 
-    public ActionResult Move(int x, int y)
+    public ActionResult Click(int x, int y, string button = "left", InputDispatchMode dispatch = InputDispatchMode.Auto, int? windowHandle = null) =>
+        Dispatch(
+            "click",
+            dispatch,
+            () => BackgroundClick(x, y, button, dispatch, windowHandle),
+            backgroundError => ForegroundClick(x, y, button, dispatch, windowHandle, backgroundError));
+
+    public ActionResult Move(int x, int y, InputDispatchMode dispatch = InputDispatchMode.Auto, int? windowHandle = null)
     {
-        var ok = Native.SetCursorPos(x, y);
-        return new("move", ok, "SetCursorPos", Details: new Dictionary<string, object?> { ["x"] = x, ["y"] = y });
+        if (dispatch == InputDispatchMode.Auto)
+        {
+            return ForegroundMove(x, y, dispatch, windowHandle, null);
+        }
+
+        return Dispatch(
+            "move",
+            dispatch,
+            () => BackgroundMove(x, y, dispatch, windowHandle),
+            backgroundError => ForegroundMove(x, y, dispatch, windowHandle, backgroundError));
     }
 
-    public ActionResult TypeText(string text)
+    public ActionResult TypeText(string text, InputDispatchMode dispatch = InputDispatchMode.Auto, int? windowHandle = null) =>
+        Dispatch(
+            "type",
+            dispatch,
+            () => BackgroundTypeText(text, dispatch, windowHandle),
+            backgroundError => ForegroundTypeText(text, dispatch, windowHandle, backgroundError));
+
+    public ActionResult Press(string key, InputDispatchMode dispatch = InputDispatchMode.Auto, int? windowHandle = null) =>
+        Dispatch(
+            "press",
+            dispatch,
+            () => BackgroundPress(key, dispatch, windowHandle),
+            backgroundError => ForegroundPress(key, dispatch, windowHandle, backgroundError));
+
+    public ActionResult Hotkey(IReadOnlyList<string> keys, InputDispatchMode dispatch = InputDispatchMode.Auto, int? windowHandle = null) =>
+        Dispatch(
+            "hotkey",
+            dispatch,
+            () => BackgroundHotkey(keys, dispatch, windowHandle),
+            backgroundError => ForegroundHotkey(keys, dispatch, windowHandle, backgroundError));
+
+    public ActionResult Scroll(int delta, int? x = null, int? y = null, InputDispatchMode dispatch = InputDispatchMode.Auto, int? windowHandle = null) =>
+        Dispatch(
+            "scroll",
+            dispatch,
+            () => BackgroundScroll(delta, x, y, dispatch, windowHandle),
+            backgroundError => ForegroundScroll(delta, x, y, dispatch, windowHandle, backgroundError));
+
+    public ActionResult Drag(int fromX, int fromY, int toX, int toY, InputDispatchMode dispatch = InputDispatchMode.Auto, int? windowHandle = null)
     {
+        if (dispatch == InputDispatchMode.Auto)
+        {
+            return ForegroundDrag(fromX, fromY, toX, toY, dispatch, windowHandle, null);
+        }
+
+        return Dispatch(
+            "drag",
+            dispatch,
+            () => BackgroundDrag(fromX, fromY, toX, toY, dispatch, windowHandle),
+            backgroundError => ForegroundDrag(fromX, fromY, toX, toY, dispatch, windowHandle, backgroundError));
+    }
+
+    private ActionResult Dispatch(
+        string action,
+        InputDispatchMode dispatch,
+        Func<ActionResult> background,
+        Func<PbwError?, ActionResult> foreground)
+    {
+        if (dispatch == InputDispatchMode.Background)
+        {
+            return background();
+        }
+
+        if (dispatch == InputDispatchMode.Foreground)
+        {
+            return foreground(null);
+        }
+
+        try
+        {
+            return background();
+        }
+        catch (PbwException ex) when (ex.Error.Code == "background_unavailable")
+        {
+            return foreground(ex.Error);
+        }
+    }
+
+    private ActionResult BackgroundClick(int x, int y, string button, InputDispatchMode dispatch, int? windowHandle)
+    {
+        var target = ResolveMouseTarget("click", InputEventKind.MouseClick, windowHandle, x, y);
+        var (down, up, mk) = MouseMessages(button);
+        PostOrThrow("click", InputEventKind.MouseClick, target.TargetHwnd, WmMouseMove, IntPtr.Zero, MakeLParam(target.ClientX, target.ClientY), target);
+        PostOrThrow("click", InputEventKind.MouseClick, target.TargetHwnd, down, new IntPtr(mk), MakeLParam(target.ClientX, target.ClientY), target);
+        Thread.Sleep(20);
+        PostOrThrow("click", InputEventKind.MouseClick, target.TargetHwnd, up, IntPtr.Zero, MakeLParam(target.ClientX, target.ClientY), target);
+        return new("click", true, "Win32.PostMessage", FormatHwnd(target.TargetHwnd), Details: BackgroundDetails(dispatch, InputEventKind.MouseClick, target, new Dictionary<string, object?> { ["x"] = x, ["y"] = y, ["button"] = button }));
+    }
+
+    private ActionResult BackgroundMove(int x, int y, InputDispatchMode dispatch, int? windowHandle)
+    {
+        var target = ResolveMouseTarget("move", InputEventKind.MouseMove, windowHandle, x, y);
+        PostOrThrow("move", InputEventKind.MouseMove, target.TargetHwnd, WmMouseMove, IntPtr.Zero, MakeLParam(target.ClientX, target.ClientY), target);
+        return new("move", true, "Win32.PostMessage", FormatHwnd(target.TargetHwnd), Details: BackgroundDetails(dispatch, InputEventKind.MouseMove, target, new Dictionary<string, object?> { ["x"] = x, ["y"] = y }));
+    }
+
+    private ActionResult BackgroundTypeText(string text, InputDispatchMode dispatch, int? windowHandle)
+    {
+        var target = ResolveWindowTarget("type", InputEventKind.TextInput, windowHandle);
         foreach (var c in text)
         {
-            var vk = Native.VkKeyScan(c);
-            if (vk == -1) continue;
-            var needsShift = (vk & 0x0100) != 0;
-            if (needsShift) Native.keybd_event(0x10, 0, 0, UIntPtr.Zero);
-            PressVirtualKey((byte)(vk & 0xff));
-            if (needsShift) Native.keybd_event(0x10, 0, 0x0002, UIntPtr.Zero);
+            if (c is '\r' or '\n')
+            {
+                PostKey("type", InputEventKind.TextInput, target, KeyToVirtualKey("enter"));
+            }
+            else
+            {
+                PostOrThrow("type", InputEventKind.TextInput, target.TargetHwnd, WmChar, new IntPtr(c), new IntPtr(1), target);
+            }
         }
-        return new("type", true, "Win32Input", Details: new Dictionary<string, object?> { ["length"] = text.Length });
+
+        return new("type", true, "Win32.PostMessage", FormatHwnd(target.TargetHwnd), Details: BackgroundDetails(dispatch, InputEventKind.TextInput, target, new Dictionary<string, object?> { ["length"] = text.Length }));
     }
 
-    public ActionResult Press(string key)
+    private ActionResult BackgroundPress(string key, InputDispatchMode dispatch, int? windowHandle)
     {
-        PressVirtualKey(KeyToVirtualKey(key));
-        return new("press", true, "Win32Input", Details: new Dictionary<string, object?> { ["key"] = key });
+        var target = ResolveWindowTarget("press", InputEventKind.Keystroke, windowHandle);
+        PostKey("press", InputEventKind.Keystroke, target, KeyToVirtualKey(key));
+        return new("press", true, "Win32.PostMessage", FormatHwnd(target.TargetHwnd), Details: BackgroundDetails(dispatch, InputEventKind.Keystroke, target, new Dictionary<string, object?> { ["key"] = key }));
     }
 
-    public ActionResult Hotkey(IReadOnlyList<string> keys)
+    private ActionResult BackgroundHotkey(IReadOnlyList<string> keys, InputDispatchMode dispatch, int? windowHandle)
     {
+        var target = ResolveWindowTarget("hotkey", InputEventKind.KeyCombo, windowHandle);
         var virtualKeys = keys.Select(KeyToVirtualKey).ToArray();
-        foreach (var key in virtualKeys) Native.keybd_event(key, 0, 0, UIntPtr.Zero);
-        foreach (var key in virtualKeys.Reverse()) Native.keybd_event(key, 0, 0x0002, UIntPtr.Zero);
-        return new("hotkey", true, "Win32Input", Details: new Dictionary<string, object?> { ["keys"] = keys });
+        foreach (var key in virtualKeys)
+        {
+            PostKeyDown("hotkey", InputEventKind.KeyCombo, target, key);
+        }
+
+        Thread.Sleep(4);
+        foreach (var key in virtualKeys.Reverse())
+        {
+            PostKeyUp("hotkey", InputEventKind.KeyCombo, target, key);
+        }
+
+        return new("hotkey", true, "Win32.PostMessage", FormatHwnd(target.TargetHwnd), Details: BackgroundDetails(dispatch, InputEventKind.KeyCombo, target, new Dictionary<string, object?> { ["keys"] = keys }));
     }
 
-    public ActionResult Scroll(int delta, int? x = null, int? y = null)
+    private ActionResult BackgroundScroll(int delta, int? x, int? y, InputDispatchMode dispatch, int? windowHandle)
     {
-        if (x is not null && y is not null) Native.SetCursorPos(x.Value, y.Value);
-        Native.mouse_event(0x0800, 0, 0, delta, UIntPtr.Zero);
-        return new("scroll", true, "Win32Input", Details: new Dictionary<string, object?> { ["delta"] = delta, ["x"] = x, ["y"] = y });
+        var target = x is not null && y is not null
+            ? ResolveMouseTarget("scroll", InputEventKind.MouseScroll, windowHandle, x.Value, y.Value)
+            : ResolveWindowTarget("scroll", InputEventKind.MouseScroll, windowHandle);
+        var lParam = x is not null && y is not null ? MakeLParam(x.Value, y.Value) : IntPtr.Zero;
+        PostOrThrow("scroll", InputEventKind.MouseScroll, target.TargetHwnd, WmMouseWheel, MakeWheelWParam(delta), lParam, target);
+        return new("scroll", true, "Win32.PostMessage", FormatHwnd(target.TargetHwnd), Details: BackgroundDetails(dispatch, InputEventKind.MouseScroll, target, new Dictionary<string, object?> { ["delta"] = delta, ["x"] = x, ["y"] = y }));
     }
 
-    public ActionResult Drag(int fromX, int fromY, int toX, int toY)
+    private ActionResult BackgroundDrag(int fromX, int fromY, int toX, int toY, InputDispatchMode dispatch, int? windowHandle)
     {
-        Native.SetCursorPos(fromX, fromY);
-        Native.mouse_event(0x0002, 0, 0, 0, UIntPtr.Zero);
-        Native.SetCursorPos(toX, toY);
-        Native.mouse_event(0x0004, 0, 0, 0, UIntPtr.Zero);
-        return new("drag", true, "Win32Input", Details: new Dictionary<string, object?> { ["fromX"] = fromX, ["fromY"] = fromY, ["toX"] = toX, ["toY"] = toY });
+        var target = ResolveMouseTarget("drag", InputEventKind.MouseDrag, windowHandle, fromX, fromY);
+        var (down, up, mk) = MouseMessages("left");
+        var start = ToClient(target.TargetHwnd, fromX, fromY);
+        var end = ToClient(target.TargetHwnd, toX, toY);
+        PostOrThrow("drag", InputEventKind.MouseDrag, target.TargetHwnd, down, new IntPtr(mk), MakeLParam(start.ClientX, start.ClientY), target);
+        for (var step = 1; step <= 8; step++)
+        {
+            var x = start.ClientX + (int)Math.Round((end.ClientX - start.ClientX) * (step / 8d));
+            var y = start.ClientY + (int)Math.Round((end.ClientY - start.ClientY) * (step / 8d));
+            PostOrThrow("drag", InputEventKind.MouseDrag, target.TargetHwnd, WmMouseMove, new IntPtr(mk), MakeLParam(x, y), target);
+        }
+
+        PostOrThrow("drag", InputEventKind.MouseDrag, target.TargetHwnd, up, IntPtr.Zero, MakeLParam(end.ClientX, end.ClientY), target);
+        return new("drag", true, "Win32.PostMessage", FormatHwnd(target.TargetHwnd), Details: BackgroundDetails(dispatch, InputEventKind.MouseDrag, target, new Dictionary<string, object?> { ["fromX"] = fromX, ["fromY"] = fromY, ["toX"] = toX, ["toY"] = toY }));
     }
 
-    private static void PressVirtualKey(byte key)
+    private ActionResult ForegroundClick(int x, int y, string button, InputDispatchMode dispatch, int? windowHandle, PbwError? backgroundError) =>
+        RunForeground("click", InputEventKind.MouseClick, dispatch, ResolveForegroundTarget(windowHandle, x, y), backgroundError, false, details =>
+        {
+            backend.SetCursorPos(x, y);
+            var (down, up) = MouseEventFlags(button);
+            backend.MouseEvent(down, 0, 0, 0, UIntPtr.Zero);
+            backend.MouseEvent(up, 0, 0, 0, UIntPtr.Zero);
+            details["x"] = x;
+            details["y"] = y;
+            details["button"] = button;
+        });
+
+    private ActionResult ForegroundMove(int x, int y, InputDispatchMode dispatch, int? windowHandle, PbwError? backgroundError)
     {
-        Native.keybd_event(key, 0, 0, UIntPtr.Zero);
-        Native.keybd_event(key, 0, 0x0002, UIntPtr.Zero);
+        var ok = backend.SetCursorPos(x, y);
+        var details = ForegroundBaseDetails(dispatch, InputEventKind.MouseMove, ResolveForegroundTarget(windowHandle, x, y), backgroundError);
+        details["x"] = x;
+        details["y"] = y;
+        details["foregroundChanged"] = false;
+        details["foregroundRestored"] = false;
+        return new("move", ok, "SetCursorPos.foreground", Details: details);
     }
 
-    private static byte KeyToVirtualKey(string key)
+    private ActionResult ForegroundTypeText(string text, InputDispatchMode dispatch, int? windowHandle, PbwError? backgroundError) =>
+        RunForeground("type", InputEventKind.TextInput, dispatch, ResolveForegroundTarget(windowHandle), backgroundError, windowHandle is not null, details =>
+        {
+            foreach (var c in text)
+            {
+                var vk = backend.VkKeyScan(c);
+                if (vk == -1) continue;
+                var needsShift = (vk & 0x0100) != 0;
+                if (needsShift) backend.KeybdEvent(0x10, 0, 0, UIntPtr.Zero);
+                PressVirtualKey((byte)(vk & 0xff));
+                if (needsShift) backend.KeybdEvent(0x10, 0, KeyEventUp, UIntPtr.Zero);
+            }
+
+            details["length"] = text.Length;
+        });
+
+    private ActionResult ForegroundPress(string key, InputDispatchMode dispatch, int? windowHandle, PbwError? backgroundError) =>
+        RunForeground("press", InputEventKind.Keystroke, dispatch, ResolveForegroundTarget(windowHandle), backgroundError, windowHandle is not null, details =>
+        {
+            PressVirtualKey(KeyToVirtualKey(key));
+            details["key"] = key;
+        });
+
+    private ActionResult ForegroundHotkey(IReadOnlyList<string> keys, InputDispatchMode dispatch, int? windowHandle, PbwError? backgroundError) =>
+        RunForeground("hotkey", InputEventKind.KeyCombo, dispatch, ResolveForegroundTarget(windowHandle), backgroundError, windowHandle is not null, details =>
+        {
+            var virtualKeys = keys.Select(KeyToVirtualKey).ToArray();
+            foreach (var key in virtualKeys) backend.KeybdEvent(key, 0, 0, UIntPtr.Zero);
+            foreach (var key in virtualKeys.Reverse()) backend.KeybdEvent(key, 0, KeyEventUp, UIntPtr.Zero);
+            details["keys"] = keys;
+        });
+
+    private ActionResult ForegroundScroll(int delta, int? x, int? y, InputDispatchMode dispatch, int? windowHandle, PbwError? backgroundError) =>
+        RunForeground("scroll", InputEventKind.MouseScroll, dispatch, ResolveForegroundTarget(windowHandle, x, y), backgroundError, false, details =>
+        {
+            if (x is not null && y is not null) backend.SetCursorPos(x.Value, y.Value);
+            backend.MouseEvent(MouseEventWheel, 0, 0, delta, UIntPtr.Zero);
+            details["delta"] = delta;
+            details["x"] = x;
+            details["y"] = y;
+        });
+
+    private ActionResult ForegroundDrag(int fromX, int fromY, int toX, int toY, InputDispatchMode dispatch, int? windowHandle, PbwError? backgroundError) =>
+        RunForeground("drag", InputEventKind.MouseDrag, dispatch, ResolveForegroundTarget(windowHandle, fromX, fromY), backgroundError, false, details =>
+        {
+            backend.SetCursorPos(fromX, fromY);
+            backend.MouseEvent(MouseEventLeftDown, 0, 0, 0, UIntPtr.Zero);
+            backend.SetCursorPos(toX, toY);
+            backend.MouseEvent(MouseEventLeftUp, 0, 0, 0, UIntPtr.Zero);
+            details["fromX"] = fromX;
+            details["fromY"] = fromY;
+            details["toX"] = toX;
+            details["toY"] = toY;
+        });
+
+    private ActionResult RunForeground(
+        string action,
+        InputEventKind kind,
+        InputDispatchMode dispatch,
+        IntPtr target,
+        PbwError? backgroundError,
+        bool requireForeground,
+        Action<Dictionary<string, object?>> send)
+    {
+        var details = ForegroundBaseDetails(dispatch, kind, target, backgroundError);
+        var previous = backend.GetForegroundWindow();
+        details["previousForegroundHwnd"] = previous == IntPtr.Zero ? null : FormatHwnd(previous);
+        var setAttempted = target != IntPtr.Zero && previous != target;
+        details["setForegroundAttempted"] = setAttempted;
+        var setOk = true;
+        if (setAttempted)
+        {
+            setOk = backend.SetForegroundWindow(target);
+            Thread.Sleep(8);
+        }
+
+        var afterSet = backend.GetForegroundWindow();
+        var targetIsForeground = target == IntPtr.Zero || afterSet == target;
+        details["setForegroundSucceeded"] = setOk && targetIsForeground;
+        details["foregroundAfterSetHwnd"] = afterSet == IntPtr.Zero ? null : FormatHwnd(afterSet);
+        details["foregroundChanged"] = previous != afterSet;
+
+        if (requireForeground && !targetIsForeground)
+        {
+            return new ActionResult(action, false, "Win32Input.foreground", target == IntPtr.Zero ? null : FormatHwnd(target), "Foreground dispatch was requested, but Windows did not make the target foreground. Input was not sent.", details);
+        }
+
+        send(details);
+        Thread.Sleep(20);
+        var afterInput = backend.GetForegroundWindow();
+        details["foregroundAfterInputHwnd"] = afterInput == IntPtr.Zero ? null : FormatHwnd(afterInput);
+
+        var restoreAttempted = target != IntPtr.Zero && previous != IntPtr.Zero && previous != target;
+        var restored = false;
+        if (restoreAttempted)
+        {
+            backend.SetForegroundWindow(previous);
+            Thread.Sleep(8);
+            restored = backend.GetForegroundWindow() == previous;
+        }
+
+        details["restoreForegroundAttempted"] = restoreAttempted;
+        details["foregroundRestored"] = restored;
+        return new ActionResult(action, true, "Win32Input.foreground", target == IntPtr.Zero ? null : FormatHwnd(target), Details: details);
+    }
+
+    private MessageTarget ResolveMouseTarget(string action, InputEventKind kind, int? windowHandle, int screenX, int screenY)
+    {
+        var root = ResolveRootWindow(windowHandle, screenX, screenY);
+        if (root == IntPtr.Zero)
+        {
+            throw BackgroundUnavailable(action, kind, IntPtr.Zero, "<unknown>", "A target HWND could not be resolved for background mouse dispatch.");
+        }
+
+        var (target, clientX, clientY) = DeepestChildFromScreenPoint(root, screenX, screenY);
+        var className = backend.GetClassName(root);
+        var messageTarget = new MessageTarget(root, target, className, clientX, clientY);
+        EnsureBackgroundAvailable(action, kind, messageTarget);
+        return messageTarget;
+    }
+
+    private MessageTarget ResolveWindowTarget(string action, InputEventKind kind, int? windowHandle)
+    {
+        if (windowHandle is null)
+        {
+            throw BackgroundUnavailable(action, kind, IntPtr.Zero, "<unknown>", "Background dispatch requires --hwnd for this command.");
+        }
+
+        var hwnd = new IntPtr(windowHandle.Value);
+        if (hwnd == IntPtr.Zero || !backend.IsWindow(hwnd))
+        {
+            throw BackgroundUnavailable(action, kind, hwnd, "<unknown>", "The requested HWND is not a valid window.");
+        }
+
+        var root = backend.GetRootWindow(hwnd);
+        var target = new MessageTarget(root, hwnd, backend.GetClassName(root), 0, 0);
+        EnsureBackgroundAvailable(action, kind, target);
+        return target;
+    }
+
+    private IntPtr ResolveForegroundTarget(int? windowHandle, int? screenX = null, int? screenY = null)
+    {
+        if (windowHandle is not null)
+        {
+            var hwnd = new IntPtr(windowHandle.Value);
+            return hwnd == IntPtr.Zero ? IntPtr.Zero : backend.GetRootWindow(hwnd);
+        }
+
+        if (screenX is not null && screenY is not null)
+        {
+            var hit = backend.WindowFromPoint(screenX.Value, screenY.Value);
+            return hit == IntPtr.Zero ? IntPtr.Zero : backend.GetRootWindow(hit);
+        }
+
+        return IntPtr.Zero;
+    }
+
+    private IntPtr ResolveRootWindow(int? windowHandle, int screenX, int screenY)
+    {
+        if (windowHandle is not null)
+        {
+            var hwnd = new IntPtr(windowHandle.Value);
+            return hwnd != IntPtr.Zero && backend.IsWindow(hwnd) ? backend.GetRootWindow(hwnd) : IntPtr.Zero;
+        }
+
+        var hit = backend.WindowFromPoint(screenX, screenY);
+        return hit == IntPtr.Zero ? IntPtr.Zero : backend.GetRootWindow(hit);
+    }
+
+    private (IntPtr Hwnd, int ClientX, int ClientY) DeepestChildFromScreenPoint(IntPtr root, int screenX, int screenY)
+    {
+        var current = root;
+        for (var depth = 0; depth < 16; depth++)
+        {
+            var x = screenX;
+            var y = screenY;
+            backend.ScreenToClient(current, ref x, ref y);
+            var child = backend.ChildWindowFromPointEx(current, x, y, ChildWindowSkipInvisibleDisabledTransparent);
+            if (child == IntPtr.Zero || child == current)
+            {
+                break;
+            }
+
+            if (child != root && !backend.IsChild(root, child))
+            {
+                break;
+            }
+
+            current = child;
+        }
+
+        var client = ToClient(current, screenX, screenY);
+        return (current, client.ClientX, client.ClientY);
+    }
+
+    private (int ClientX, int ClientY) ToClient(IntPtr hwnd, int screenX, int screenY)
+    {
+        var x = screenX;
+        var y = screenY;
+        backend.ScreenToClient(hwnd, ref x, ref y);
+        return (x, y);
+    }
+
+    private void EnsureBackgroundAvailable(string action, InputEventKind kind, MessageTarget target)
+    {
+        if (WouldDropBackground(target.ClassName, kind, out var reason))
+        {
+            throw BackgroundUnavailable(action, kind, target.RootHwnd, target.ClassName, reason);
+        }
+    }
+
+    private static bool WouldDropBackground(string className, InputEventKind kind, out string reason)
+    {
+        if (className.StartsWith("Chrome_WidgetWin_", StringComparison.OrdinalIgnoreCase) ||
+            className.StartsWith("CefBrowser", StringComparison.OrdinalIgnoreCase))
+        {
+            if (kind is InputEventKind.MouseClick or InputEventKind.MouseMove or InputEventKind.MouseScroll or InputEventKind.KeyCombo)
+            {
+                reason = "Chromium/Electron windows are known to ignore these posted input messages.";
+                return true;
+            }
+        }
+
+        if (className.StartsWith("gdkWindow", StringComparison.OrdinalIgnoreCase) ||
+            className.StartsWith("gdkSurface", StringComparison.OrdinalIgnoreCase))
+        {
+            if (kind == InputEventKind.MouseClick)
+            {
+                reason = "GTK toplevel windows are known to ignore posted button clicks for many widgets.";
+                return true;
+            }
+        }
+
+        if (className.StartsWith("SAL", StringComparison.OrdinalIgnoreCase))
+        {
+            if (kind is InputEventKind.Keystroke or InputEventKind.KeyCombo)
+            {
+                reason = "VCL/SAL windows route accelerators through key state that PostMessage does not update.";
+                return true;
+            }
+        }
+
+        if (className is "ApplicationFrameWindow" or "Windows.UI.Core.CoreWindow" or "WinUIDesktopWin32WindowClass" or "Microsoft.UI.Content.DesktopChildSiteBridge")
+        {
+            if (kind is InputEventKind.TextInput or InputEventKind.Keystroke or InputEventKind.KeyCombo)
+            {
+                reason = "XAML/UWP input dispatchers consume system input queue events and commonly ignore posted keyboard messages.";
+                return true;
+            }
+        }
+
+        if (className.StartsWith("HwndWrapper", StringComparison.OrdinalIgnoreCase) && kind == InputEventKind.MouseDrag)
+        {
+            reason = "WPF drag handlers commonly poll button state that PostMessage does not update.";
+            return true;
+        }
+
+        reason = "";
+        return false;
+    }
+
+    private PbwException BackgroundUnavailable(string action, InputEventKind kind, IntPtr hwnd, string targetClass, string reason)
+    {
+        var details = new Dictionary<string, object?>
+        {
+            ["dispatch"] = "background",
+            ["eventKind"] = InputDispatchPolicy.ToWireString(kind),
+            ["targetHwnd"] = hwnd == IntPtr.Zero ? null : FormatHwnd(hwnd),
+            ["targetClass"] = targetClass,
+            ["reason"] = reason,
+            ["suggestion"] = "Retry with --dispatch foreground, or target a semantic UIA action when available."
+        };
+        return new PbwException(new PbwError(
+            "background_unavailable",
+            $"Background dispatch is not available for {action}: {reason}",
+            action,
+            details,
+            "Retry with --dispatch foreground if foreground input is acceptable."));
+    }
+
+    private void PostOrThrow(string action, InputEventKind kind, IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam, MessageTarget target)
+    {
+        if (!backend.PostMessage(hwnd, message, wParam, lParam))
+        {
+            throw BackgroundUnavailable(action, kind, target.RootHwnd, target.ClassName, "PostMessage failed: " + backend.LastErrorMessage());
+        }
+    }
+
+    private void PostKey(string action, InputEventKind kind, MessageTarget target, byte virtualKey)
+    {
+        PostKeyDown(action, kind, target, virtualKey);
+        Thread.Sleep(4);
+        PostKeyUp(action, kind, target, virtualKey);
+    }
+
+    private void PostKeyDown(string action, InputEventKind kind, MessageTarget target, byte virtualKey)
+    {
+        var lParam = KeyLParam(virtualKey, keyUp: false);
+        PostOrThrow(action, kind, target.TargetHwnd, WmKeyDown, new IntPtr(virtualKey), lParam, target);
+    }
+
+    private void PostKeyUp(string action, InputEventKind kind, MessageTarget target, byte virtualKey)
+    {
+        var lParam = KeyLParam(virtualKey, keyUp: true);
+        PostOrThrow(action, kind, target.TargetHwnd, WmKeyUp, new IntPtr(virtualKey), lParam, target);
+    }
+
+    private IntPtr KeyLParam(byte virtualKey, bool keyUp)
+    {
+        var scan = backend.MapVirtualKey(virtualKey, 0);
+        var value = 1u | (scan << 16);
+        if (keyUp)
+        {
+            value |= 1u << 30;
+            value |= 1u << 31;
+        }
+
+        return new IntPtr(unchecked((int)value));
+    }
+
+    private static Dictionary<string, object?> BackgroundDetails(InputDispatchMode dispatch, InputEventKind kind, MessageTarget target, Dictionary<string, object?> extra)
+    {
+        var details = new Dictionary<string, object?>
+        {
+            ["dispatch"] = InputDispatchPolicy.ToWireString(dispatch),
+            ["actualDispatch"] = "background",
+            ["eventKind"] = InputDispatchPolicy.ToWireString(kind),
+            ["targetHwnd"] = FormatHwnd(target.TargetHwnd),
+            ["rootHwnd"] = FormatHwnd(target.RootHwnd),
+            ["targetClass"] = target.ClassName,
+            ["clientX"] = target.ClientX,
+            ["clientY"] = target.ClientY,
+            ["foregroundChanged"] = false,
+            ["foregroundRestored"] = false
+        };
+        foreach (var (key, value) in extra)
+        {
+            details[key] = value;
+        }
+
+        return details;
+    }
+
+    private static Dictionary<string, object?> ForegroundBaseDetails(InputDispatchMode dispatch, InputEventKind kind, IntPtr target, PbwError? backgroundError)
+    {
+        var details = new Dictionary<string, object?>
+        {
+            ["dispatch"] = InputDispatchPolicy.ToWireString(dispatch),
+            ["actualDispatch"] = "foreground",
+            ["eventKind"] = InputDispatchPolicy.ToWireString(kind),
+            ["targetHwnd"] = target == IntPtr.Zero ? null : FormatHwnd(target)
+        };
+        if (backgroundError is not null)
+        {
+            details["backgroundFallback"] = new Dictionary<string, object?>
+            {
+                ["code"] = backgroundError.Code,
+                ["message"] = backgroundError.Message,
+                ["details"] = backgroundError.Details
+            };
+        }
+
+        return details;
+    }
+
+    private void PressVirtualKey(byte key)
+    {
+        backend.KeybdEvent(key, 0, 0, UIntPtr.Zero);
+        backend.KeybdEvent(key, 0, KeyEventUp, UIntPtr.Zero);
+    }
+
+    private byte KeyToVirtualKey(string key)
     {
         return key.ToLowerInvariant() switch
         {
             "ctrl" or "control" => 0x11,
             "shift" => 0x10,
-            "alt" => 0x12,
-            "enter" => 0x0D,
+            "alt" or "menu" => 0x12,
+            "enter" or "return" => 0x0D,
             "esc" or "escape" => 0x1B,
             "tab" => 0x09,
             "backspace" => 0x08,
             "delete" or "del" => 0x2E,
+            "insert" or "ins" => 0x2D,
+            "home" => 0x24,
+            "end" => 0x23,
+            "pageup" or "pgup" => 0x21,
+            "pagedown" or "pgdn" => 0x22,
+            "space" => 0x20,
             "left" => 0x25,
             "up" => 0x26,
             "right" => 0x27,
             "down" => 0x28,
-            _ when key.Length == 1 => (byte)(Native.VkKeyScan(key[0]) & 0xff),
+            "f1" => 0x70,
+            "f2" => 0x71,
+            "f3" => 0x72,
+            "f4" => 0x73,
+            "f5" => 0x74,
+            "f6" => 0x75,
+            "f7" => 0x76,
+            "f8" => 0x77,
+            "f9" => 0x78,
+            "f10" => 0x79,
+            "f11" => 0x7A,
+            "f12" => 0x7B,
+            _ when key.Length == 1 => ScanSingleCharacterKey(key[0]),
             _ => throw new ArgumentException($"Unsupported key '{key}'.")
         };
     }
+
+    private byte ScanSingleCharacterKey(char character)
+    {
+        var scan = backend.VkKeyScan(character);
+        if (scan == -1)
+        {
+            throw new ArgumentException($"Unsupported key '{character}'.");
+        }
+
+        return (byte)(scan & 0xff);
+    }
+
+    private static (uint Down, uint Up, ushort Mk) MouseMessages(string button) => button.ToLowerInvariant() switch
+    {
+        "right" => (WmRButtonDown, WmRButtonUp, MkRightButton),
+        "middle" => (WmMButtonDown, WmMButtonUp, MkMiddleButton),
+        _ => (WmLButtonDown, WmLButtonUp, MkLeftButton)
+    };
+
+    private static (int Down, int Up) MouseEventFlags(string button) => button.ToLowerInvariant() switch
+    {
+        "right" => (MouseEventRightDown, MouseEventRightUp),
+        "middle" => (MouseEventMiddleDown, MouseEventMiddleUp),
+        _ => (MouseEventLeftDown, MouseEventLeftUp)
+    };
+
+    private static IntPtr MakeLParam(int x, int y) =>
+        new(unchecked((int)(((uint)(ushort)y << 16) | (ushort)x)));
+
+    private static IntPtr MakeWheelWParam(int delta) =>
+        new(unchecked((int)((uint)(ushort)delta << 16)));
+
+    private static string FormatHwnd(IntPtr hwnd) => "0x" + hwnd.ToInt64().ToString("x");
+
+    private sealed record MessageTarget(IntPtr RootHwnd, IntPtr TargetHwnd, string ClassName, int ClientX, int ClientY);
 }
 
 public sealed class WindowsElementAutomationService : IElementAutomationService
@@ -1650,15 +2307,20 @@ internal static partial class Native
 
     internal delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
     [DllImport("user32.dll")] internal static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll")] internal static extern bool IsWindow(IntPtr hWnd);
     [DllImport("user32.dll")] internal static extern bool IsWindowVisible(IntPtr hWnd);
     [DllImport("user32.dll")] internal static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
     [DllImport("user32.dll")] internal static extern int GetWindowTextLength(IntPtr hWnd);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] internal static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
     [DllImport("user32.dll", SetLastError = true)] internal static extern bool GetWindowRect(IntPtr hwnd, out RECT lpRect);
     [DllImport("user32.dll")] internal static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] internal static extern uint GetWindowThreadProcessId(IntPtr hWnd, out int processId);
     [DllImport("user32.dll")] internal static extern bool IsIconic(IntPtr hWnd);
     [DllImport("user32.dll")] internal static extern IntPtr GetAncestor(IntPtr hwnd, uint gaFlags);
     [DllImport("user32.dll")] internal static extern IntPtr WindowFromPoint(POINT point);
+    [DllImport("user32.dll")] internal static extern bool ScreenToClient(IntPtr hWnd, ref POINT lpPoint);
+    [DllImport("user32.dll")] internal static extern IntPtr ChildWindowFromPointEx(IntPtr hwndParent, POINT pt, uint flags);
+    [DllImport("user32.dll")] internal static extern bool IsChild(IntPtr hWndParent, IntPtr hWnd);
     [DllImport("user32.dll", SetLastError = true)] internal static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll", SetLastError = true)] internal static extern bool MoveWindow(IntPtr hWnd, int x, int y, int width, int height, bool repaint);
     [DllImport("user32.dll")] internal static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
@@ -1669,6 +2331,7 @@ internal static partial class Native
     [DllImport("user32.dll")] internal static extern void mouse_event(int dwFlags, int dx, int dy, int dwData, UIntPtr dwExtraInfo);
     [DllImport("user32.dll")] internal static extern void keybd_event(byte bVk, byte bScan, int dwFlags, UIntPtr dwExtraInfo);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] internal static extern short VkKeyScan(char ch);
+    [DllImport("user32.dll")] internal static extern uint MapVirtualKey(uint uCode, uint uMapType);
     [DllImport("user32.dll", SetLastError = true)] internal static extern bool OpenClipboard(IntPtr hWndNewOwner);
     [DllImport("user32.dll", SetLastError = true)] internal static extern bool CloseClipboard();
     [DllImport("user32.dll", SetLastError = true)] internal static extern bool EmptyClipboard();

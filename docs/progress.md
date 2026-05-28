@@ -54,6 +54,9 @@
 - Window capture now uses `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)` for visual capture/crop bounds when available, falling back to Win32 window rectangles.
 - Mostly-black BMP detection is intentionally strict so all-zero DirectComposition-style failures are degraded without flagging merely dark nonblack UIs.
 - Real-machine capture validation uses the existing WPF TestHost; arbitrary z-order occlusion is not exercised as an e2e test because it would be flaky, so occlusion is reported through the guarded desktop-crop branch and covered by lower-level metadata/attempt tests.
+- Input dispatch policy is implemented for click/type/press/hotkey/scroll/drag/move with `auto`, `background`, and `foreground` modes exposed through CLI and MCP schemas.
+- UI Automation semantic click actions remain preferred for element targets. Background Win32 message dispatch is attempted where feasible; explicit background requests return structured `background_unavailable` instead of silently using foreground/global input.
+- Foreground/global dispatch results include additive details for requested dispatch, actual dispatch, target HWND, foreground set/restore attempts, and background fallback diagnostics when auto mode falls back.
 
 ## Capture Quality Goal Validation
 
@@ -66,3 +69,15 @@
 - `dotnet run --project src/Pbw.Cli -- see`: passed, created a snapshot and BMP image with `captureStatus: ok`, `captureMethod: Windows.Graphics.Capture`, and additive `captureDetails` quality/attempt metadata
 - WPF TestHost e2e-style validation: passed through `WindowsCaptureService`, asserted capture metadata, and verified minimized-window capture returns `unavailable` with `minimized` and `noPixels`
 - Deterministic metadata coverage now includes desktop-crop occlusion `unavailable` reporting and invalid-window bounds failures carrying `qualityStatus: unavailable`.
+
+## Input Dispatch Goal Validation
+
+- PATH `dotnet` on this host still has no SDK; the literal `dotnet restore` failed with "No .NET SDKs were found", so validation used `%TEMP%\dotnet-sdk-local\dotnet.exe` version 8.0.421.
+- `dotnet restore`: passed with the local SDK
+- `dotnet build --configuration Release`: passed with 0 warnings and 0 errors
+- `dotnet test --configuration Release`: passed, 95 passed, 0 failed, 0 skipped
+- `dotnet format --verify-no-changes --verbosity minimal`: initial run found line-ending normalization only; `dotnet format --verbosity minimal` normalized C# files, and final verify passed
+- `dotnet run --project src/Pbw.Cli -- doctor`: passed, all checks returned `ok`
+- `dotnet run --project src/Pbw.Cli -- click --help`: passed, returned structured JSON with `--dispatch auto|background|foreground`
+- `dotnet run --project src/Pbw.Cli -- type --help`: passed, returned structured JSON with `--dispatch auto|background|foreground`
+- WPF TestHost e2e-style validation: passed through the guarded Windows integration test, including real `WindowsInputService` returning `background_unavailable` for WPF background drag instead of sending foreground/global input.
