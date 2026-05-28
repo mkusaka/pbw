@@ -25,7 +25,180 @@ public interface IWindowsOcrService
     IReadOnlyList<OcrTextSnapshot> Recognize(string? imagePath);
 }
 
-public sealed record CaptureResult(bool Success, string Method, string? ImagePath, string? Message = null);
+public sealed record CaptureResult(
+    bool Success,
+    string Method,
+    string? ImagePath,
+    string? Message = null,
+    string Status = CaptureQualityStatus.Ok,
+    IReadOnlyDictionary<string, object?>? Details = null);
+
+public static class CaptureQualityStatus
+{
+    public const string Ok = "ok";
+    public const string Degraded = "degraded";
+    public const string Unavailable = "unavailable";
+}
+
+public sealed record CaptureAttempt(
+    string Method,
+    string Status,
+    string? Message = null,
+    IReadOnlyDictionary<string, object?>? Details = null);
+
+public sealed record BmpQualityInfo(
+    bool IsBmp,
+    int Width,
+    int Height,
+    long PixelCount,
+    long BlackPixels,
+    double BlackRatio,
+    bool IsMostlyBlack,
+    string Status,
+    string? Message = null);
+
+public static class BmpCaptureDiagnostics
+{
+    private const double MostlyBlackThreshold = 0.995d;
+    private const int MinimumBmpHeaderLength = 54;
+    private const long MaxInspectablePixels = 100_000_000L;
+
+    public static BmpQualityInfo Analyze(string path)
+    {
+        if (!File.Exists(path))
+        {
+            return Unavailable("BMP file was not found.");
+        }
+
+        try
+        {
+            var bytes = File.ReadAllBytes(path);
+            if (bytes.Length < MinimumBmpHeaderLength || bytes[0] != 'B' || bytes[1] != 'M')
+            {
+                return Unavailable("Capture output was not a BMP file.", isBmp: false);
+            }
+
+            var pixelOffset = (long)BitConverter.ToInt32(bytes, 10);
+            var dibHeaderSize = BitConverter.ToInt32(bytes, 14);
+            var width = BitConverter.ToInt32(bytes, 18);
+            var signedHeight = BitConverter.ToInt32(bytes, 22);
+            var bitCount = BitConverter.ToInt16(bytes, 28);
+            var compression = BitConverter.ToInt32(bytes, 30);
+            var height = signedHeight == int.MinValue ? (long)int.MaxValue + 1 : Math.Abs((long)signedHeight);
+            if (width <= 0 || height <= 0)
+            {
+                return BmpUnavailable(width, height, "BMP had no pixels.");
+            }
+
+            if (dibHeaderSize < 40 || pixelOffset < MinimumBmpHeaderLength || pixelOffset > bytes.LongLength)
+            {
+                return BmpUnavailable(width, height, "BMP header had an invalid DIB size or pixel data offset.");
+            }
+
+            if (compression != 0 || bitCount is not (24 or 32))
+            {
+                return BmpUnavailable(width, height, $"Unsupported BMP format: {bitCount} bpp, compression {compression}.");
+            }
+
+            var bytesPerPixel = bitCount / 8;
+            if (!TryCalculateLayout(width, height, bitCount, pixelOffset, out var stride, out var pixelCount, out var requiredLength, out var layoutError))
+            {
+                return BmpUnavailable(width, height, layoutError);
+            }
+
+            if (pixelCount > MaxInspectablePixels)
+            {
+                return BmpUnavailable(width, height, $"BMP dimensions exceed supported inspection size: {width}x{height} ({pixelCount} pixels).");
+            }
+
+            if (requiredLength > bytes.LongLength)
+            {
+                return BmpUnavailable(width, height, $"BMP pixel data was incomplete: required {requiredLength} bytes, found {bytes.LongLength}.");
+            }
+
+            long blackPixels = 0;
+            var inspectHeight = (int)height;
+            for (var y = 0; y < inspectHeight; y++)
+            {
+                var row = pixelOffset + (y * stride);
+                for (var x = 0; x < width; x++)
+                {
+                    var index = (int)(row + ((long)x * bytesPerPixel));
+                    if (bytes[index] == 0 && bytes[index + 1] == 0 && bytes[index + 2] == 0)
+                    {
+                        blackPixels++;
+                    }
+                }
+            }
+
+            var blackRatio = pixelCount == 0 ? 0 : (double)blackPixels / pixelCount;
+            var mostlyBlack = pixelCount > 0 && blackRatio >= MostlyBlackThreshold;
+            return new BmpQualityInfo(
+                true,
+                width,
+                inspectHeight,
+                pixelCount,
+                blackPixels,
+                blackRatio,
+                mostlyBlack,
+                mostlyBlack ? CaptureQualityStatus.Degraded : CaptureQualityStatus.Ok,
+                mostlyBlack ? "BMP was mostly black; capture may contain no useful rendered pixels." : null);
+        }
+        catch (Exception ex)
+        {
+            return Unavailable(ex.Message);
+        }
+    }
+
+    private static bool TryCalculateLayout(
+        int width,
+        long height,
+        short bitCount,
+        long pixelOffset,
+        out long stride,
+        out long pixelCount,
+        out long requiredLength,
+        out string message)
+    {
+        stride = 0;
+        pixelCount = 0;
+        requiredLength = 0;
+        message = "";
+
+        try
+        {
+            checked
+            {
+                var bitsPerRow = (long)width * bitCount;
+                stride = ((bitsPerRow + 31) / 32) * 4;
+                pixelCount = (long)width * height;
+                requiredLength = pixelOffset + (stride * height);
+            }
+        }
+        catch (OverflowException)
+        {
+            message = "BMP dimensions or pixel offset were too large to inspect safely.";
+            return false;
+        }
+
+        if (stride <= 0 || pixelCount <= 0 || requiredLength <= pixelOffset)
+        {
+            message = "BMP layout was invalid or empty.";
+            return false;
+        }
+
+        return true;
+    }
+
+    private static BmpQualityInfo BmpUnavailable(int width, long height, string message) =>
+        new(true, width, ToReportedDimension(height), 0, 0, 0, false, CaptureQualityStatus.Unavailable, message);
+
+    private static int ToReportedDimension(long value) =>
+        value > int.MaxValue ? int.MaxValue : (int)value;
+
+    private static BmpQualityInfo Unavailable(string message, bool isBmp = true) =>
+        new(isBmp, 0, 0, 0, 0, 0, false, CaptureQualityStatus.Unavailable, message);
+}
 
 public sealed class WindowsSnapshotSource(
     IWindowService windows,
@@ -55,8 +228,9 @@ public sealed class WindowsSnapshotSource(
             new Dictionary<string, object?>
             {
                 ["captureMethod"] = captureResult.Method,
-                ["captureStatus"] = captureResult.Success ? "ok" : "degraded",
+                ["captureStatus"] = captureResult.Status,
                 ["captureMessage"] = captureResult.Message,
+                ["captureDetails"] = captureResult.Details,
                 ["ocrStatus"] = ocrText.Count > 0 ? "ok" : "empty",
                 ["annotationStatus"] = captureResult.ImagePath is null ? "unavailable" : "ok"
             });
@@ -722,43 +896,317 @@ public sealed class WindowsCaptureService : IWindowsCaptureService
     public CaptureResult CaptureDesktop(string imagePath, IReadOnlyList<WindowSnapshot> windows, IReadOnlyList<ElementSnapshot> elements)
     {
         var bounds = new Bounds(0, 0, Native.GetSystemMetrics(0), Native.GetSystemMetrics(1));
-        var graphicsResult = TryCapturePrimaryMonitorWithGraphicsCapture(imagePath);
-        if (graphicsResult.Success)
+        var attempts = new List<CaptureAttempt>();
+        var commonDetails = new Dictionary<string, object?>
         {
-            AnnotateBmp(imagePath, windows.Select(w => w.Bounds).Concat(Flatten(elements).Select(e => e.Bounds)), bounds);
-            return graphicsResult;
+            ["captureBounds"] = bounds,
+            ["boundsSource"] = "primaryMonitor"
+        };
+        var annotationBounds = windows.Select(w => w.Bounds).Concat(Flatten(elements).Select(e => e.Bounds)).ToArray();
+
+        var graphicsResult = AssessBmp(TryCapturePrimaryMonitorWithGraphicsCapture(imagePath));
+        attempts.Add(ToAttempt(graphicsResult));
+        if (IsUsable(graphicsResult))
+        {
+            AnnotateBmp(imagePath, annotationBounds, bounds);
+            return FinalizeResult(graphicsResult, attempts, commonDetails);
         }
 
-        var result = CaptureRegion(IntPtr.Zero, bounds, imagePath, "BitBlt.desktop");
-        if (result.Success) AnnotateBmp(imagePath, windows.Select(w => w.Bounds).Concat(Flatten(elements).Select(e => e.Bounds)), bounds);
-        return result with { Message = graphicsResult.Message is null ? result.Message : "Windows.Graphics.Capture monitor failed: " + graphicsResult.Message };
+        var result = AssessBmp(CaptureRegion(IntPtr.Zero, bounds, imagePath, "BitBlt.desktop"));
+        attempts.Add(ToAttempt(result));
+        if (result.Success)
+        {
+            AnnotateBmp(imagePath, annotationBounds, bounds);
+        }
+
+        return FinalizeResult(result, attempts, commonDetails);
     }
 
     public CaptureResult CaptureWindow(int handle, string imagePath, IReadOnlyList<ElementSnapshot> elements)
     {
-        if (!Native.GetWindowRect(new IntPtr(handle), out var rect))
-            return new CaptureResult(false, "PrintWindow", null, new Win32Exception(Marshal.GetLastWin32Error()).Message);
-
-        var bounds = new Bounds(rect.Left, rect.Top, rect.Right - rect.Left, rect.Bottom - rect.Top);
-        var graphicsResult = TryCaptureWindowWithGraphicsCapture(new IntPtr(handle), imagePath);
-        if (graphicsResult.Success)
+        var hwnd = new IntPtr(handle);
+        var attempts = new List<CaptureAttempt>();
+        if (!TryGetWindowCaptureBounds(hwnd, out var windowBounds, out var boundsMessage))
         {
-            AnnotateBmp(imagePath, Flatten(elements).Select(e => e.Bounds), bounds);
-            return graphicsResult;
+            var failure = new CaptureResult(
+                false,
+                "window.bounds",
+                null,
+                boundsMessage,
+                CaptureQualityStatus.Unavailable,
+                new Dictionary<string, object?> { ["attempts"] = attempts.ToArray() });
+            return failure;
         }
 
-        var result = CaptureRegion(new IntPtr(handle), bounds, imagePath, "PrintWindow");
-        if (!result.Success) result = CaptureRegion(IntPtr.Zero, bounds, imagePath, "BitBlt.desktop-crop");
-        if (result.Success) AnnotateBmp(imagePath, Flatten(elements).Select(e => e.Bounds), bounds);
-        return result with { Message = graphicsResult.Message is null ? result.Message : "Windows.Graphics.Capture failed: " + graphicsResult.Message };
+        var commonDetails = WindowBoundsDetails(windowBounds);
+        if (boundsMessage is not null)
+        {
+            commonDetails["boundsMessage"] = boundsMessage;
+        }
+
+        if (Native.IsIconic(hwnd))
+        {
+            var minimized = new CaptureResult(
+                false,
+                "none",
+                null,
+                "Window is minimized; no rendered pixels are available for image capture.",
+                CaptureQualityStatus.Unavailable,
+                MergeDetails(commonDetails, new Dictionary<string, object?>
+                {
+                    ["minimized"] = true,
+                    ["noPixels"] = true
+                }));
+            attempts.Add(ToAttempt(minimized));
+            return FinalizeResult(minimized, attempts, commonDetails);
+        }
+
+        var annotationBounds = Flatten(elements).Select(e => e.Bounds).ToArray();
+        var graphicsResult = AssessBmp(TryCaptureWindowWithGraphicsCapture(hwnd, imagePath));
+        attempts.Add(ToAttempt(graphicsResult));
+        if (IsUsable(graphicsResult))
+        {
+            AnnotateBmp(imagePath, annotationBounds, windowBounds.CaptureBounds);
+            return FinalizeResult(graphicsResult, attempts, commonDetails);
+        }
+
+        var printWindow = AssessBmp(CaptureRegion(hwnd, windowBounds.Win32Bounds, imagePath, "PrintWindow", windowBounds.CaptureBounds));
+        attempts.Add(ToAttempt(printWindow));
+        if (IsUsable(printWindow))
+        {
+            AnnotateBmp(imagePath, annotationBounds, windowBounds.CaptureBounds);
+            return FinalizeResult(printWindow, attempts, commonDetails);
+        }
+
+        var occlusion = TryGetOcclusion(hwnd, windowBounds.CaptureBounds);
+        var desktopCropDetails = new Dictionary<string, object?>
+        {
+            ["occluded"] = occlusion.Occluded,
+            ["occlusionCheck"] = occlusion.Status
+        };
+        if (occlusion.Message is not null)
+        {
+            desktopCropDetails["occlusionMessage"] = occlusion.Message;
+        }
+
+        var desktopCropRaw = CaptureRegion(IntPtr.Zero, windowBounds.CaptureBounds, imagePath, "BitBlt.desktop-crop");
+        var desktopCrop = desktopCropRaw with
+        {
+            Status = desktopCropRaw.Success && occlusion.Occluded == true ? CaptureQualityStatus.Degraded : desktopCropRaw.Status,
+            Details = desktopCropDetails,
+            Message = desktopCropRaw.Success && occlusion.Occluded == true
+                ? "Desktop crop may show another window because the target is occluded."
+                : desktopCropRaw.Message
+        };
+        desktopCrop = AssessBmp(desktopCrop);
+        attempts.Add(ToAttempt(desktopCrop));
+        if (desktopCrop.Success)
+        {
+            AnnotateBmp(imagePath, annotationBounds, windowBounds.CaptureBounds);
+            return FinalizeResult(desktopCrop, attempts, commonDetails);
+        }
+
+        return FinalizeResult(desktopCrop, attempts, commonDetails);
     }
+
+    private static bool IsUsable(CaptureResult result) => result.Success && result.Status == CaptureQualityStatus.Ok;
+
+    private static CaptureResult AssessBmp(CaptureResult result)
+    {
+        if (!result.Success || string.IsNullOrWhiteSpace(result.ImagePath))
+        {
+            return result;
+        }
+
+        var quality = BmpCaptureDiagnostics.Analyze(result.ImagePath);
+        var details = MergeDetails(result.Details, new Dictionary<string, object?> { ["quality"] = quality });
+        if (quality.Status == CaptureQualityStatus.Ok)
+        {
+            return result with { Status = result.Status, Details = details };
+        }
+
+        return result with
+        {
+            Status = CaptureQualityStatus.Degraded,
+            Message = CombineMessages(result.Message, quality.Message),
+            Details = details
+        };
+    }
+
+    private static CaptureAttempt ToAttempt(CaptureResult result) => new(result.Method, result.Status, result.Message, result.Details);
+
+    private static CaptureResult FinalizeResult(
+        CaptureResult result,
+        IReadOnlyList<CaptureAttempt> attempts,
+        IReadOnlyDictionary<string, object?> commonDetails)
+    {
+        var details = MergeDetails(commonDetails, result.Details);
+        details["attempts"] = attempts;
+        details["qualityStatus"] = result.Status;
+
+        var fallbackMessages = attempts
+            .Where(a => !string.Equals(a.Method, result.Method, StringComparison.Ordinal) && a.Status != CaptureQualityStatus.Ok && !string.IsNullOrWhiteSpace(a.Message))
+            .Select(a => $"{a.Method}: {a.Message}");
+        return result with
+        {
+            Details = details,
+            Message = CombineMessages(result.Message, string.Join("; ", fallbackMessages))
+        };
+    }
+
+    private static Dictionary<string, object?> WindowBoundsDetails(WindowCaptureBounds bounds)
+    {
+        var details = new Dictionary<string, object?>
+        {
+            ["win32Bounds"] = bounds.Win32Bounds,
+            ["captureBounds"] = bounds.CaptureBounds,
+            ["boundsSource"] = bounds.Source
+        };
+        if (bounds.DwmExtendedFrameBounds is not null)
+        {
+            details["dwmExtendedFrameBounds"] = bounds.DwmExtendedFrameBounds;
+        }
+
+        return details;
+    }
+
+    private static Dictionary<string, object?> MergeDetails(
+        IReadOnlyDictionary<string, object?>? first,
+        IReadOnlyDictionary<string, object?>? second)
+    {
+        var result = first is null ? new Dictionary<string, object?>() : new Dictionary<string, object?>(first);
+        if (second is null)
+        {
+            return result;
+        }
+
+        foreach (var (key, value) in second)
+        {
+            result[key] = value;
+        }
+
+        return result;
+    }
+
+    private static string? CombineMessages(params string?[] messages)
+    {
+        var nonEmpty = messages.Where(m => !string.IsNullOrWhiteSpace(m)).Distinct(StringComparer.Ordinal).ToArray();
+        return nonEmpty.Length == 0 ? null : string.Join("; ", nonEmpty);
+    }
+
+    private static bool TryGetWindowCaptureBounds(IntPtr hwnd, out WindowCaptureBounds bounds, out string? message)
+    {
+        bounds = default!;
+        if (!Native.GetWindowRect(hwnd, out var rect))
+        {
+            message = new Win32Exception(Marshal.GetLastWin32Error()).Message;
+            return false;
+        }
+
+        var win32 = RectToBounds(rect);
+        if (TryGetDwmExtendedFrameBounds(hwnd, out var dwm, out message))
+        {
+            bounds = new WindowCaptureBounds(win32, dwm, dwm, "dwmExtendedFrame");
+            return true;
+        }
+
+        bounds = new WindowCaptureBounds(win32, win32, null, "win32WindowRect");
+        return true;
+    }
+
+    private static bool TryGetDwmExtendedFrameBounds(IntPtr hwnd, out Bounds bounds, out string? message)
+    {
+        bounds = default!;
+        message = null;
+        try
+        {
+            var hr = Native.DwmGetWindowAttribute(hwnd, Native.DwmwaExtendedFrameBounds, out var rect, Marshal.SizeOf<RECT>());
+            if (hr < 0)
+            {
+                message = "DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS) failed with HRESULT 0x" + hr.ToString("X8");
+                return false;
+            }
+
+            var candidate = RectToBounds(rect);
+            if (candidate.Width <= 0 || candidate.Height <= 0)
+            {
+                message = "DWM extended frame bounds were empty.";
+                return false;
+            }
+
+            bounds = candidate;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            message = ex.Message;
+            return false;
+        }
+    }
+
+    private static OcclusionResult TryGetOcclusion(IntPtr hwnd, Bounds bounds)
+    {
+        if (hwnd == IntPtr.Zero || bounds.Width <= 4 || bounds.Height <= 4)
+        {
+            return new OcclusionResult(null, "unavailable", "Target bounds were too small for occlusion sampling.");
+        }
+
+        try
+        {
+            var targetRoot = Native.GetAncestor(hwnd, Native.GaRoot);
+            if (targetRoot == IntPtr.Zero)
+            {
+                targetRoot = hwnd;
+            }
+
+            var points = new[]
+            {
+                new POINT { X = bounds.X + 2, Y = bounds.Y + 2 },
+                new POINT { X = bounds.X + bounds.Width - 3, Y = bounds.Y + 2 },
+                new POINT { X = bounds.X + 2, Y = bounds.Y + bounds.Height - 3 },
+                new POINT { X = bounds.X + bounds.Width - 3, Y = bounds.Y + bounds.Height - 3 },
+                new POINT { X = bounds.CenterX, Y = bounds.CenterY }
+            };
+            var covered = 0;
+            foreach (var point in points)
+            {
+                var owner = Native.WindowFromPoint(point);
+                if (owner == IntPtr.Zero)
+                {
+                    continue;
+                }
+
+                var ownerRoot = Native.GetAncestor(owner, Native.GaRoot);
+                if (ownerRoot == IntPtr.Zero)
+                {
+                    ownerRoot = owner;
+                }
+
+                if (ownerRoot != targetRoot)
+                {
+                    covered++;
+                }
+            }
+
+            return new OcclusionResult(covered >= 2, "windowFromPoint", $"{covered} of {points.Length} sample points were covered by another root window.");
+        }
+        catch (Exception ex)
+        {
+            return new OcclusionResult(null, "unavailable", ex.Message);
+        }
+    }
+
+    private static Bounds RectToBounds(RECT rect) => new(rect.Left, rect.Top, rect.Right - rect.Left, rect.Bottom - rect.Top);
 
     private static CaptureResult TryCaptureWindowWithGraphicsCapture(IntPtr hwnd, string path)
     {
         try
         {
+            if (Native.IsIconic(hwnd))
+                return new CaptureResult(false, "Windows.Graphics.Capture", null, "WGC cannot capture a minimized window because no rendered pixels are available.", CaptureQualityStatus.Unavailable);
+
             if (!GraphicsCaptureSession.IsSupported())
-                return new CaptureResult(false, "Windows.Graphics.Capture", null, "GraphicsCaptureSession is not supported.");
+                return new CaptureResult(false, "Windows.Graphics.Capture", null, "GraphicsCaptureSession is not supported.", CaptureQualityStatus.Unavailable);
 
             using var d3d = CreateDirect3DDevice();
             var item = CreateCaptureItemForWindow(hwnd);
@@ -766,7 +1214,7 @@ public sealed class WindowsCaptureService : IWindowsCaptureService
         }
         catch (Exception ex)
         {
-            return new CaptureResult(false, "Windows.Graphics.Capture", null, ex.Message);
+            return new CaptureResult(false, "Windows.Graphics.Capture", null, ex.Message, CaptureQualityStatus.Unavailable);
         }
     }
 
@@ -775,11 +1223,11 @@ public sealed class WindowsCaptureService : IWindowsCaptureService
         try
         {
             if (!GraphicsCaptureSession.IsSupported())
-                return new CaptureResult(false, "Windows.Graphics.Capture", null, "GraphicsCaptureSession is not supported.");
+                return new CaptureResult(false, "Windows.Graphics.Capture", null, "GraphicsCaptureSession is not supported.", CaptureQualityStatus.Unavailable);
 
             var monitor = Native.MonitorFromPoint(new POINT { X = 0, Y = 0 }, 1);
             if (monitor == IntPtr.Zero)
-                return new CaptureResult(false, "Windows.Graphics.Capture", null, "Primary monitor handle was not found.");
+                return new CaptureResult(false, "Windows.Graphics.Capture", null, "Primary monitor handle was not found.", CaptureQualityStatus.Unavailable);
 
             using var d3d = CreateDirect3DDevice();
             var item = CreateCaptureItemForMonitor(monitor);
@@ -787,7 +1235,7 @@ public sealed class WindowsCaptureService : IWindowsCaptureService
         }
         catch (Exception ex)
         {
-            return new CaptureResult(false, "Windows.Graphics.Capture", null, ex.Message);
+            return new CaptureResult(false, "Windows.Graphics.Capture", null, ex.Message, CaptureQualityStatus.Unavailable);
         }
     }
 
@@ -796,7 +1244,7 @@ public sealed class WindowsCaptureService : IWindowsCaptureService
         try
         {
             if (item is null || item.Size.Width <= 0 || item.Size.Height <= 0)
-                return new CaptureResult(false, "Windows.Graphics.Capture", null, "Could not create a valid GraphicsCaptureItem.");
+                return new CaptureResult(false, "Windows.Graphics.Capture", null, "Could not create a valid GraphicsCaptureItem.", CaptureQualityStatus.Unavailable);
 
             using var frameReady = new AutoResetEvent(false);
             Direct3D11CaptureFrame? captured = null;
@@ -821,14 +1269,14 @@ public sealed class WindowsCaptureService : IWindowsCaptureService
             };
             session.StartCapture();
             if (!frameReady.WaitOne(TimeSpan.FromSeconds(2)) || captured is null)
-                return new CaptureResult(false, "Windows.Graphics.Capture", null, "No capture frame arrived before timeout.");
+                return new CaptureResult(false, "Windows.Graphics.Capture", null, "No capture frame arrived before timeout.", CaptureQualityStatus.Unavailable);
 
             SaveSurfaceAsBmp(captured.Surface, path);
             return new CaptureResult(true, "Windows.Graphics.Capture", path);
         }
         catch (Exception ex)
         {
-            return new CaptureResult(false, "Windows.Graphics.Capture", null, ex.Message);
+            return new CaptureResult(false, "Windows.Graphics.Capture", null, ex.Message, CaptureQualityStatus.Unavailable);
         }
     }
 
@@ -938,22 +1386,56 @@ public sealed class WindowsCaptureService : IWindowsCaptureService
         return new Direct3DDeviceHandle(device, d3dDevice, d3dContext);
     }
 
-    private static CaptureResult CaptureRegion(IntPtr hwnd, Bounds bounds, string path, string method)
+    private static CaptureResult CaptureRegion(IntPtr hwnd, Bounds bounds, string path, string method, Bounds? cropBounds = null)
     {
-        if (bounds.Width <= 0 || bounds.Height <= 0) return new CaptureResult(false, method, null, "Capture bounds were empty.");
+        if (bounds.Width <= 0 || bounds.Height <= 0)
+            return new CaptureResult(false, method, null, "Capture bounds were empty.", CaptureQualityStatus.Unavailable);
+
         var screenDc = Native.GetDC(IntPtr.Zero);
+        if (screenDc == IntPtr.Zero)
+            return new CaptureResult(false, method, null, "GetDC returned null.", CaptureQualityStatus.Unavailable);
+
         var memoryDc = Native.CreateCompatibleDC(screenDc);
+        if (memoryDc == IntPtr.Zero)
+        {
+            Native.ReleaseDC(IntPtr.Zero, screenDc);
+            return new CaptureResult(false, method, null, "CreateCompatibleDC returned null.", CaptureQualityStatus.Unavailable);
+        }
+
         var bitmap = Native.CreateCompatibleBitmap(screenDc, bounds.Width, bounds.Height);
+        if (bitmap == IntPtr.Zero)
+        {
+            Native.DeleteDC(memoryDc);
+            Native.ReleaseDC(IntPtr.Zero, screenDc);
+            return new CaptureResult(false, method, null, "CreateCompatibleBitmap returned null.", CaptureQualityStatus.Unavailable);
+        }
+
         var old = Native.SelectObject(memoryDc, bitmap);
         try
         {
             var ok = hwnd != IntPtr.Zero && method == "PrintWindow"
                 ? Native.PrintWindow(hwnd, memoryDc, 0)
                 : Native.BitBlt(memoryDc, 0, 0, bounds.Width, bounds.Height, screenDc, bounds.X, bounds.Y, 0x00CC0020);
-            if (!ok) return new CaptureResult(false, method, null, new Win32Exception(Marshal.GetLastWin32Error()).Message);
+            if (!ok) return new CaptureResult(false, method, null, new Win32Exception(Marshal.GetLastWin32Error()).Message, CaptureQualityStatus.Unavailable);
             var pixels = ReadPixels(memoryDc, bitmap, bounds.Width, bounds.Height);
-            SaveBmp(path, bounds.Width, bounds.Height, pixels);
-            return new CaptureResult(true, method, path);
+            var outputBounds = bounds;
+            if (cropBounds is not null && TryCropPixels(pixels, bounds, cropBounds, out var croppedPixels, out var croppedBounds))
+            {
+                pixels = croppedPixels;
+                outputBounds = croppedBounds;
+            }
+
+            SaveBmp(path, outputBounds.Width, outputBounds.Height, pixels);
+            return new CaptureResult(true, method, path, Details: new Dictionary<string, object?>
+            {
+                ["sourceBounds"] = bounds,
+                ["outputBounds"] = outputBounds,
+                ["croppedToDwmBounds"] = cropBounds is not null && outputBounds != bounds
+            });
+        }
+        catch (Exception ex)
+        {
+            return new CaptureResult(false, method, null, ex.Message, CaptureQualityStatus.Unavailable);
         }
         finally
         {
@@ -962,6 +1444,32 @@ public sealed class WindowsCaptureService : IWindowsCaptureService
             Native.DeleteDC(memoryDc);
             Native.ReleaseDC(IntPtr.Zero, screenDc);
         }
+    }
+
+    private static bool TryCropPixels(byte[] pixels, Bounds sourceBounds, Bounds cropBounds, out byte[] croppedPixels, out Bounds croppedBounds)
+    {
+        croppedPixels = Array.Empty<byte>();
+        croppedBounds = sourceBounds;
+        var offsetX = cropBounds.X - sourceBounds.X;
+        var offsetY = cropBounds.Y - sourceBounds.Y;
+        if (offsetX < 0 || offsetY < 0 || cropBounds.Width <= 0 || cropBounds.Height <= 0 ||
+            offsetX + cropBounds.Width > sourceBounds.Width || offsetY + cropBounds.Height > sourceBounds.Height)
+        {
+            return false;
+        }
+
+        var sourceStride = sourceBounds.Width * 4;
+        var cropStride = cropBounds.Width * 4;
+        croppedPixels = new byte[cropStride * cropBounds.Height];
+        for (var row = 0; row < cropBounds.Height; row++)
+        {
+            var sourceIndex = ((offsetY + row) * sourceStride) + (offsetX * 4);
+            var destinationIndex = row * cropStride;
+            Array.Copy(pixels, sourceIndex, croppedPixels, destinationIndex, cropStride);
+        }
+
+        croppedBounds = cropBounds;
+        return true;
     }
 
     private static byte[] ReadPixels(IntPtr dc, IntPtr bitmap, int width, int height)
@@ -1054,6 +1562,14 @@ public sealed class WindowsCaptureService : IWindowsCaptureService
             foreach (var child in Flatten(element.Children)) yield return child;
         }
     }
+
+    private sealed record WindowCaptureBounds(
+        Bounds Win32Bounds,
+        Bounds CaptureBounds,
+        Bounds? DwmExtendedFrameBounds,
+        string Source);
+
+    private sealed record OcclusionResult(bool? Occluded, string Status, string? Message);
 }
 
 internal sealed class Direct3DDeviceHandle(IDirect3DDevice device, IntPtr d3dDevice, IntPtr d3dContext) : IDisposable
@@ -1113,15 +1629,20 @@ public sealed class WindowsDoctorCheckService : IDoctorCheckService
 
 internal static partial class Native
 {
+    internal const uint GaRoot = 2;
+    internal const int DwmwaExtendedFrameBounds = 9;
+
     internal delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
     [DllImport("user32.dll")] internal static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
     [DllImport("user32.dll")] internal static extern bool IsWindowVisible(IntPtr hWnd);
     [DllImport("user32.dll")] internal static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
     [DllImport("user32.dll")] internal static extern int GetWindowTextLength(IntPtr hWnd);
-    [DllImport("user32.dll")] internal static extern bool GetWindowRect(IntPtr hwnd, out RECT lpRect);
+    [DllImport("user32.dll", SetLastError = true)] internal static extern bool GetWindowRect(IntPtr hwnd, out RECT lpRect);
     [DllImport("user32.dll")] internal static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] internal static extern uint GetWindowThreadProcessId(IntPtr hWnd, out int processId);
     [DllImport("user32.dll")] internal static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")] internal static extern IntPtr GetAncestor(IntPtr hwnd, uint gaFlags);
+    [DllImport("user32.dll")] internal static extern IntPtr WindowFromPoint(POINT point);
     [DllImport("user32.dll", SetLastError = true)] internal static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll", SetLastError = true)] internal static extern bool MoveWindow(IntPtr hWnd, int x, int y, int width, int height, bool repaint);
     [DllImport("user32.dll")] internal static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
@@ -1151,6 +1672,7 @@ internal static partial class Native
     [DllImport("gdi32.dll")] internal static extern bool DeleteDC(IntPtr hdc);
     [DllImport("gdi32.dll", SetLastError = true)] internal static extern bool BitBlt(IntPtr hdc, int x, int y, int cx, int cy, IntPtr hdcSrc, int x1, int y1, uint rop);
     [DllImport("gdi32.dll", SetLastError = true)] internal static extern int GetDIBits(IntPtr hdc, IntPtr hbm, uint start, uint cLines, byte[] lpvBits, ref BitmapInfo lpbmi, uint usage);
+    [DllImport("dwmapi.dll")] internal static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out RECT pvAttribute, int cbAttribute);
     [DllImport("d3d11.dll", SetLastError = true)]
     internal static extern int D3D11CreateDevice(
         IntPtr pAdapter,

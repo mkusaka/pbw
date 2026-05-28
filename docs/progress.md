@@ -50,3 +50,18 @@
 - Scoop support: added `scoop/pbw.json` for installing the GitHub Release ZIP directly
 - `scripts/package.ps1 -Version 0.1.0`: passed, produced `pbw_0.1.0_windows_x64.zip`
 - Release ZIP smoke test: passed, extracted `pbw.exe --help` returned structured JSON
+- Capture quality diagnostics: capture results now carry additive `captureDetails` metadata with fallback attempts, BMP quality/mostly-black classification, DWM extended-frame bounds where available, desktop-crop occlusion checks, and minimized/no-pixels unavailable results.
+- Window capture now uses `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)` for visual capture/crop bounds when available, falling back to Win32 window rectangles.
+- Mostly-black BMP detection is intentionally strict so all-zero DirectComposition-style failures are degraded without flagging merely dark nonblack UIs.
+- Real-machine capture validation uses the existing WPF TestHost; arbitrary z-order occlusion is not exercised as an e2e test because it would be flaky, so occlusion is reported through the guarded desktop-crop branch and covered by lower-level metadata/attempt tests.
+
+## Capture Quality Goal Validation
+
+- PATH `dotnet` on this host still has no SDK; validation used the repo's local .NET 8 SDK at `%TEMP%\dotnet-sdk-local\dotnet.exe`.
+- `dotnet restore`: passed
+- `dotnet build --configuration Release`: passed with 0 warnings and 0 errors
+- `dotnet test --configuration Release`: passed, 72 passed, 0 failed, 0 skipped
+- `dotnet format --verify-no-changes --verbosity minimal`: initial run found line-ending normalization only; `dotnet format --verbosity minimal` normalized files, and final verify passed
+- `dotnet run --project src/Pbw.Cli -- doctor`: passed, all checks returned `ok`
+- `dotnet run --project src/Pbw.Cli -- see`: passed, created a snapshot and BMP image with `captureStatus: ok`, `captureMethod: Windows.Graphics.Capture`, and additive `captureDetails` quality/attempt metadata
+- WPF TestHost e2e-style validation: passed through `WindowsCaptureService`, asserted capture metadata, and verified minimized-window capture returns `unavailable` with `minimized` and `noPixels`

@@ -129,6 +129,190 @@ public sealed class CoreTests
     }
 }
 
+public sealed class CaptureDiagnosticsTests
+{
+    [Fact]
+    public void BmpCaptureDiagnostics_Detects_All_Black_Bmp()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "pbw-black-" + Guid.NewGuid().ToString("N") + ".bmp");
+        try
+        {
+            WriteBmp(path, 16, 16, (_, _) => ((byte)0, (byte)0, (byte)0));
+
+            var quality = BmpCaptureDiagnostics.Analyze(path);
+
+            Assert.True(quality.IsBmp);
+            Assert.True(quality.IsMostlyBlack);
+            Assert.Equal(CaptureQualityStatus.Degraded, quality.Status);
+            Assert.Equal(256, quality.BlackPixels);
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void BmpCaptureDiagnostics_Detects_Mostly_Black_Bmp()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "pbw-mostly-black-" + Guid.NewGuid().ToString("N") + ".bmp");
+        try
+        {
+            WriteBmp(path, 100, 100, (x, y) => x < 2 && y < 10 ? ((byte)255, (byte)255, (byte)255) : ((byte)0, (byte)0, (byte)0));
+
+            var quality = BmpCaptureDiagnostics.Analyze(path);
+
+            Assert.True(quality.IsMostlyBlack);
+            Assert.Equal(CaptureQualityStatus.Degraded, quality.Status);
+            Assert.True(quality.BlackRatio >= 0.995d);
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void BmpCaptureDiagnostics_Does_Not_Mark_Dark_Nonblack_Bmp_As_Black()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "pbw-dark-" + Guid.NewGuid().ToString("N") + ".bmp");
+        try
+        {
+            WriteBmp(path, 24, 24, (_, _) => ((byte)1, (byte)1, (byte)1));
+
+            var quality = BmpCaptureDiagnostics.Analyze(path);
+
+            Assert.False(quality.IsMostlyBlack);
+            Assert.Equal(CaptureQualityStatus.Ok, quality.Status);
+            Assert.Equal(0, quality.BlackPixels);
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void BmpCaptureDiagnostics_Rejects_Implausibly_Large_Malformed_Bmp_Quickly()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "pbw-malformed-large-" + Guid.NewGuid().ToString("N") + ".bmp");
+        try
+        {
+            WriteBmpHeaderOnly(path, int.MaxValue, int.MaxValue);
+
+            BmpQualityInfo? quality = null;
+            var stopwatch = Stopwatch.StartNew();
+            var exception = Record.Exception(() => quality = BmpCaptureDiagnostics.Analyze(path));
+            stopwatch.Stop();
+
+            Assert.Null(exception);
+            Assert.NotNull(quality);
+            Assert.Equal(CaptureQualityStatus.Unavailable, quality!.Status);
+            Assert.Contains("too large", quality.Message);
+            Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(1), $"Analyze took {stopwatch.Elapsed}.");
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task WindowsSnapshotSource_Propagates_Capture_Metadata_Details()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "pbw-tests", Guid.NewGuid().ToString("N"));
+        var attempts = new[]
+        {
+            new CaptureAttempt("Windows.Graphics.Capture", CaptureQualityStatus.Unavailable, "unsupported"),
+            new CaptureAttempt("BitBlt.desktop", CaptureQualityStatus.Degraded, "mostly black")
+        };
+        var capture = new MetadataCaptureService(new CaptureResult(
+            true,
+            "BitBlt.desktop",
+            Path.Combine(root, "capture.bmp"),
+            "fallback used",
+            CaptureQualityStatus.Degraded,
+            new Dictionary<string, object?>
+            {
+                ["attempts"] = attempts,
+                ["qualityStatus"] = CaptureQualityStatus.Degraded,
+                ["occluded"] = true,
+                ["occlusionCheck"] = "windowFromPoint"
+            }));
+        var source = new WindowsSnapshotSource(new FakeWindowService(), new FakeAutomation(), capture, new EmptyOcrService(), root);
+
+        var snapshot = await source.CaptureAsync(CancellationToken.None);
+
+        Assert.NotNull(snapshot.Metadata);
+        Assert.Equal("BitBlt.desktop", snapshot.Metadata!["captureMethod"]);
+        Assert.Equal(CaptureQualityStatus.Degraded, snapshot.Metadata["captureStatus"]);
+        Assert.Equal("fallback used", snapshot.Metadata["captureMessage"]);
+        var details = Assert.IsAssignableFrom<IReadOnlyDictionary<string, object?>>(snapshot.Metadata["captureDetails"]);
+        Assert.Same(attempts, details["attempts"]);
+        Assert.Equal(CaptureQualityStatus.Degraded, details["qualityStatus"]);
+        Assert.True((bool)details["occluded"]!);
+        Assert.Equal("windowFromPoint", details["occlusionCheck"]);
+    }
+
+    private static void WriteBmp(string path, int width, int height, Func<int, int, (byte R, byte G, byte B)> pixel)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        using var stream = File.Create(path);
+        using var writer = new BinaryWriter(stream);
+        var pixelSize = width * height * 4;
+        writer.Write((byte)'B');
+        writer.Write((byte)'M');
+        writer.Write(14 + 40 + pixelSize);
+        writer.Write(0);
+        writer.Write(14 + 40);
+        writer.Write(40);
+        writer.Write(width);
+        writer.Write(-height);
+        writer.Write((short)1);
+        writer.Write((short)32);
+        writer.Write(0);
+        writer.Write(pixelSize);
+        writer.Write(2835);
+        writer.Write(2835);
+        writer.Write(0);
+        writer.Write(0);
+        for (var y = 0; y < height; y++)
+        {
+            for (var x = 0; x < width; x++)
+            {
+                var (r, g, b) = pixel(x, y);
+                writer.Write(b);
+                writer.Write(g);
+                writer.Write(r);
+                writer.Write((byte)255);
+            }
+        }
+    }
+
+    private static void WriteBmpHeaderOnly(string path, int width, int signedHeight)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        using var stream = File.Create(path);
+        using var writer = new BinaryWriter(stream);
+        writer.Write((byte)'B');
+        writer.Write((byte)'M');
+        writer.Write(54);
+        writer.Write(0);
+        writer.Write(54);
+        writer.Write(40);
+        writer.Write(width);
+        writer.Write(signedHeight);
+        writer.Write((short)1);
+        writer.Write((short)32);
+        writer.Write(0);
+        writer.Write(0);
+        writer.Write(2835);
+        writer.Write(2835);
+        writer.Write(0);
+        writer.Write(0);
+    }
+}
+
 public sealed class CliTests
 {
     [Fact]
@@ -322,7 +506,7 @@ public sealed class WindowsIntegrationTests
     [Fact]
     public void Window_List_Is_Safe_On_Windows_Desktop()
     {
-        if (!OperatingSystem.IsWindows())
+        if (!TestEnvironment.HasInteractiveDesktop())
         {
             return;
         }
@@ -338,7 +522,7 @@ public sealed class WindowsRealApiIntegrationTests
     [Fact]
     public async Task Wpf_TestHost_Exercises_Win32_Capture_And_UIAutomation_Patterns()
     {
-        if (!OperatingSystem.IsWindows())
+        if (!TestEnvironment.HasInteractiveDesktop())
         {
             return;
         }
@@ -381,6 +565,11 @@ public sealed class WindowsRealApiIntegrationTests
             var capturePath = Path.Combine(Path.GetTempPath(), "pbw-capture-" + Guid.NewGuid().ToString("N") + ".bmp");
             var capture = new WindowsCaptureService().CaptureWindow(handle, capturePath, automation.ReadTree());
             Assert.True(capture.Success, capture.Message);
+            Assert.Equal(CaptureQualityStatus.Ok, capture.Status);
+            Assert.NotNull(capture.Details);
+            Assert.True(capture.Details!.ContainsKey("attempts"));
+            Assert.True(capture.Details.ContainsKey("captureBounds"));
+            Assert.True(capture.Details.ContainsKey("boundsSource"));
             if (GraphicsCaptureSession.IsSupported())
             {
                 Assert.True(capture.Method == "Windows.Graphics.Capture", capture.Message ?? capture.Method);
@@ -396,6 +585,20 @@ public sealed class WindowsRealApiIntegrationTests
             Assert.True(File.Exists(snapshot.ImagePath));
             Assert.NotEmpty(snapshot.Windows);
             Assert.NotEmpty(snapshot.Elements);
+
+            var minimize = windowService.Minimize(handle);
+            Assert.True(minimize.Performed, minimize.Message);
+            await WaitForAsync(() => windowService.ListWindows().Any(w => w.Handle == handle && w.IsMinimized), TimeSpan.FromSeconds(5));
+
+            var minimizedCapturePath = Path.Combine(Path.GetTempPath(), "pbw-minimized-" + Guid.NewGuid().ToString("N") + ".bmp");
+            var minimizedCapture = new WindowsCaptureService().CaptureWindow(handle, minimizedCapturePath, Array.Empty<ElementSnapshot>());
+            Assert.False(minimizedCapture.Success);
+            Assert.Equal(CaptureQualityStatus.Unavailable, minimizedCapture.Status);
+            Assert.Equal("none", minimizedCapture.Method);
+            Assert.Null(minimizedCapture.ImagePath);
+            Assert.NotNull(minimizedCapture.Details);
+            Assert.True((bool)minimizedCapture.Details!["minimized"]!);
+            Assert.True((bool)minimizedCapture.Details["noPixels"]!);
         }
         finally
         {
@@ -411,7 +614,7 @@ public sealed class WindowsRealApiIntegrationTests
     [Fact]
     public void WindowsOcrService_Recognizes_Text_From_Controlled_Bmp()
     {
-        if (!OperatingSystem.IsWindows() || OcrEngine.TryCreateFromUserProfileLanguages() is null)
+        if (!TestEnvironment.HasInteractiveDesktop() || OcrEngine.TryCreateFromUserProfileLanguages() is null)
         {
             return;
         }
@@ -573,6 +776,22 @@ internal sealed class FakeClipboard : IClipboardService
 internal sealed class FakeDoctor : IDoctorCheckService
 {
     public IReadOnlyList<DoctorCheck> RunChecks(PbwConfig config) => new[] { new DoctorCheck("fake", "ok", "ok") };
+}
+
+internal sealed class MetadataCaptureService(CaptureResult result) : IWindowsCaptureService
+{
+    public CaptureResult CaptureDesktop(string imagePath, IReadOnlyList<WindowSnapshot> windows, IReadOnlyList<ElementSnapshot> elements) => result;
+    public CaptureResult CaptureWindow(int handle, string imagePath, IReadOnlyList<ElementSnapshot> elements) => result;
+}
+
+internal sealed class EmptyOcrService : IWindowsOcrService
+{
+    public IReadOnlyList<OcrTextSnapshot> Recognize(string? imagePath) => Array.Empty<OcrTextSnapshot>();
+}
+
+internal static class TestEnvironment
+{
+    public static bool HasInteractiveDesktop() => OperatingSystem.IsWindows() && Environment.UserInteractive;
 }
 
 internal sealed class FakeExecutor : IPbwCommandExecutor

@@ -65,6 +65,14 @@ Snapshots contain:
 - optional `imagePath`
 - optional `metadata`
 
+Capture metadata is additive and must remain compatible with `pbw.stable.v1`.
+Known capture keys include `captureMethod`, `captureStatus`, `captureMessage`,
+and optional `captureDetails`. `captureStatus` is one of `ok`, `degraded`, or
+`unavailable`. `captureDetails` may include fallback `attempts`, BMP `quality`
+diagnostics, `qualityStatus`, `captureBounds`, `win32Bounds`,
+`dwmExtendedFrameBounds`, `boundsSource`, `occluded`, `occlusionCheck`,
+`minimized`, and `noPixels`. Consumers must ignore unknown metadata keys.
+
 Elements include stable IDs, names, roles, bounds, automation IDs, state, supported patterns, and children.
 
 ## Safety and Configuration
@@ -82,6 +90,13 @@ The Windows layer should prefer native APIs in this order:
 5. OCR through Windows OCR where feasible, with a safe degraded no-op fallback.
 
 Unavailable capabilities must be reported through structured degraded results rather than raw exceptions.
+Window capture should use DWM extended frame bounds for visual capture/crop
+bounds when available, then fall back to Win32 window rectangles. BMP captures
+are checked for all-black or mostly-black output before accepting a backend.
+Desktop-crop fallback reports occlusion metadata when a safe `WindowFromPoint`
+sample can determine that another root window covers the target. Minimized
+window capture reports `unavailable` with `minimized` and `noPixels` metadata
+instead of returning a misleading image.
 
 ## MCP Behavior
 
