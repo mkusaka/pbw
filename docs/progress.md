@@ -81,3 +81,16 @@
 - `dotnet run --project src/Pbw.Cli -- click --help`: passed, returned structured JSON with `--dispatch auto|background|foreground`
 - `dotnet run --project src/Pbw.Cli -- type --help`: passed, returned structured JSON with `--dispatch auto|background|foreground`
 - WPF TestHost e2e-style validation: passed through the guarded Windows integration test, including real `WindowsInputService` returning `background_unavailable` for WPF background drag instead of sending foreground/global input.
+
+## UIA Robustness Goal Validation
+
+- PATH `dotnet` on this host still has no SDK; the literal `dotnet restore` failed with "No .NET SDKs were found", so validation used `%TEMP%\dotnet-sdk-local\dotnet.exe` version 8.0.421.
+- `dotnet restore`: passed with the local SDK
+- `dotnet build --configuration Release`: passed with 0 warnings and 0 errors
+- `dotnet test --configuration Release`: passed, 98 passed, 0 failed, 0 skipped
+- `dotnet format --verify-no-changes --verbosity minimal`: initial run found line-ending normalization only; `dotnet format --verbosity minimal` normalized C# files, and final verify passed
+- `dotnet run --project src/Pbw.Cli -- doctor`: passed, all checks returned `ok`
+- `dotnet run --project src/Pbw.Cli -- see`: passed, created snapshot `snapshot-1779990173471` with `captureStatus: ok`, `captureMethod: Windows.Graphics.Capture`, `qualityStatus: ok`, and `ocrStatus: ok`
+- WPF TestHost e2e-style validation: passed through the guarded Windows integration test, including real `WindowsElementAutomationService` detecting `RangeValue`, setting `RangeSlider` to 73 through `RangeValuePattern`, and returning structured invalid/out-of-range details.
+- UIA timeout/degraded behavior is covered by deterministic unit seams rather than a deliberately hung real provider.
+- Known limitation: a timed-out provider call returns a degraded placeholder to the caller, but the underlying UIA call may continue on the worker thread until Windows/UIA returns.

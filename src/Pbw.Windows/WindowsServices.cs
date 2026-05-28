@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -1218,22 +1219,50 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
 {
     private const int MaxDepth = 5;
     private const int MaxChildrenPerNode = 80;
+    private const int MaxTotalElements = 1500;
+    private static readonly TimeSpan DefaultTreeReadTimeout = TimeSpan.FromSeconds(3);
+
+    private readonly TimeSpan treeReadTimeout;
+    private readonly Func<IReadOnlyList<ElementSnapshot>> readTreeCore;
+
+    public WindowsElementAutomationService()
+        : this(DefaultTreeReadTimeout, null)
+    {
+    }
+
+    internal WindowsElementAutomationService(TimeSpan treeReadTimeout, Func<IReadOnlyList<ElementSnapshot>>? readTreeCore)
+    {
+        this.treeReadTimeout = treeReadTimeout <= TimeSpan.Zero ? DefaultTreeReadTimeout : treeReadTimeout;
+        this.readTreeCore = readTreeCore ?? ReadTreeCore;
+    }
 
     public IReadOnlyList<ElementSnapshot> ReadTree()
     {
         try
         {
-            var roots = AutomationElement.RootElement.FindAll(TreeScope.Children, Condition.TrueCondition);
-            return roots.Cast<AutomationElement>()
-                .Take(MaxChildrenPerNode)
-                .Select((element, index) => ToSnapshot(element, "uia", index, 0))
-                .Where(e => e is not null)
-                .Cast<ElementSnapshot>()
-                .ToArray();
+            var task = Task.Run(readTreeCore);
+            if (task.Wait(treeReadTimeout))
+            {
+                return task.GetAwaiter().GetResult();
+            }
+
+            return new[]
+            {
+                DegradedElement(
+                    "uia-timeout",
+                    $"UI Automation tree read exceeded {treeReadTimeout.TotalMilliseconds:0} ms.",
+                    "timeout",
+                    new Dictionary<string, object?> { ["timeoutMs"] = (int)treeReadTimeout.TotalMilliseconds })
+            };
+        }
+        catch (AggregateException ex)
+        {
+            var inner = ex.Flatten().InnerException ?? ex;
+            return new[] { DegradedElement("uia-error", inner.Message, "exception", ExceptionDetails(inner)) };
         }
         catch (Exception ex)
         {
-            return new[] { new ElementSnapshot("uia-error", ex.Message, "error", new Bounds(0, 0, 0, 0), Enabled: false) };
+            return new[] { DegradedElement("uia-error", ex.Message, "exception", ExceptionDetails(ex)) };
         }
     }
 
@@ -1241,7 +1270,12 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
     {
         var element = FindElement(target);
         if (element is null) return NotFound("set-value", target);
-        if (element.TryGetCurrentPattern(ValuePattern.Pattern, out var pattern) && pattern is ValuePattern valuePattern)
+        if (TryGetCurrentPattern<RangeValuePattern>(element, RangeValuePattern.Pattern, out var rangePattern))
+        {
+            return SetRangeValue(element, rangePattern, value);
+        }
+
+        if (TryGetCurrentPattern<ValuePattern>(element, ValuePattern.Pattern, out var valuePattern))
         {
             valuePattern.SetValue(value);
             return new ActionResult("set-value", true, "UIAutomation.ValuePattern", ElementId(element));
@@ -1311,9 +1345,9 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
 
     public IReadOnlyList<MenuItemInfo> ListMenus(TargetSpec target)
     {
-        var root = FindElement(target) ?? AutomationElement.RootElement;
-        return root.FindAll(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.MenuItem))
-            .Cast<AutomationElement>()
+        var root = FindElement(target) ?? RootElement();
+        return EnumerateElements(root, includeRoot: false)
+            .Where(e => ControlTypeEquals(e, ControlType.MenuItem))
             .Take(200)
             .Select(e => new MenuItemInfo(SafeName(e), SafeBool(e, AutomationElement.IsEnabledProperty), ElementId(e)))
             .ToArray();
@@ -1321,9 +1355,8 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
 
     public ActionResult ClickMenu(TargetSpec target, string menu)
     {
-        var item = AutomationElement.RootElement
-            .FindAll(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.MenuItem))
-            .Cast<AutomationElement>()
+        var item = EnumerateElements(RootElement(), includeRoot: false)
+            .Where(e => ControlTypeEquals(e, ControlType.MenuItem))
             .FirstOrDefault(e => SafeName(e).Contains(menu, StringComparison.OrdinalIgnoreCase));
         if (item is null) return new ActionResult("menu.click", false, "UIAutomation", menu, "Menu item was not found.");
         return InvokeElement("menu.click", item);
@@ -1331,18 +1364,19 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
 
     public IReadOnlyList<DialogInfo> ListDialogs()
     {
-        return AutomationElement.RootElement.FindAll(TreeScope.Children, new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Window))
+        var diagnostics = new UiaTraversalDiagnostics();
+        return FindChildren(RootElement(), diagnostics)
             .Cast<AutomationElement>()
-            .Where(e => SafeName(e).Length > 0)
-            .Select(e => new DialogInfo(ElementId(e), SafeName(e), Children(e, ElementId(e), 0)))
+            .Where(e => ControlTypeEquals(e, ControlType.Window) && SafeName(e).Length > 0)
+            .Select(e => new DialogInfo(ElementId(e), SafeName(e), Children(e, 0, new UiaTraversalState(MaxTotalElements), diagnostics)))
             .ToArray();
     }
 
     public ActionResult ClickDialog(TargetSpec target, string button)
     {
-        var dialog = FindElement(target) ?? AutomationElement.RootElement;
-        var buttonElement = dialog.FindAll(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button))
-            .Cast<AutomationElement>()
+        var dialog = FindElement(target) ?? RootElement();
+        var buttonElement = EnumerateElements(dialog, includeRoot: false)
+            .Where(e => ControlTypeEquals(e, ControlType.Button))
             .FirstOrDefault(e => SafeName(e).Contains(button, StringComparison.OrdinalIgnoreCase));
         if (buttonElement is null) return new ActionResult("dialog.click", false, "UIAutomation", button, "Dialog button was not found.");
         return InvokeElement("dialog.click", buttonElement);
@@ -1350,12 +1384,10 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
 
     public ActionResult InputDialog(TargetSpec target, string value)
     {
-        var dialog = FindElement(target) ?? AutomationElement.RootElement;
-        var edit = dialog.FindAll(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit))
-            .Cast<AutomationElement>()
-            .FirstOrDefault();
+        var dialog = FindElement(target) ?? RootElement();
+        var edit = EnumerateElements(dialog, includeRoot: false).FirstOrDefault(e => ControlTypeEquals(e, ControlType.Edit));
         if (edit is null) return new ActionResult("dialog.input", false, "UIAutomation", null, "Dialog input target was not found.");
-        if (edit.TryGetCurrentPattern(ValuePattern.Pattern, out var pattern) && pattern is ValuePattern valuePattern)
+        if (TryGetCurrentPattern<ValuePattern>(edit, ValuePattern.Pattern, out var valuePattern))
         {
             valuePattern.SetValue(value);
             return new ActionResult("dialog.input", true, "UIAutomation.ValuePattern", ElementId(edit));
@@ -1367,15 +1399,15 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
     {
         var dialog = FindElement(target);
         if (dialog is null) return new ActionResult("dialog.dismiss", false, "UIAutomation", null, "Dialog target was not found.");
-        var close = dialog.FindAll(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button))
-            .Cast<AutomationElement>()
+        var close = EnumerateElements(dialog, includeRoot: false)
+            .Where(e => ControlTypeEquals(e, ControlType.Button))
             .FirstOrDefault(e => SafeName(e).Equals("Cancel", StringComparison.OrdinalIgnoreCase) || SafeName(e).Equals("Close", StringComparison.OrdinalIgnoreCase));
         return close is null ? PerformAction(target, "focus") : InvokeElement("dialog.dismiss", close);
     }
 
     private static ActionResult InvokeElement(string action, AutomationElement element)
     {
-        if (element.TryGetCurrentPattern(InvokePattern.Pattern, out var pattern) && pattern is InvokePattern invoke)
+        if (TryGetCurrentPattern<InvokePattern>(element, InvokePattern.Pattern, out var invoke))
         {
             invoke.Invoke();
             return new ActionResult(action, true, "UIAutomation.InvokePattern", ElementId(element));
@@ -1385,21 +1417,88 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
 
     private AutomationElement? FindElement(TargetSpec target)
     {
-        AutomationElement searchRoot = AutomationElement.RootElement;
+        AutomationElement searchRoot = RootElement();
         if (target.WindowHandle is not null)
         {
-            try
+            var hwnd = new IntPtr(target.WindowHandle.Value);
+            var handleRoot = ElementFromHandle(hwnd);
+            if (target.AutomationId is null && target.Text is null && target.Role is null && target.X is null && target.Y is null && target.Index is null)
             {
-                searchRoot = AutomationElement.FromHandle(new IntPtr(target.WindowHandle.Value));
-                if (target.AutomationId is null && target.Text is null && target.Role is null && target.X is null && target.Y is null && target.Index is null)
+                return handleRoot ?? FindWindowRootFromDesktop(hwnd, searchRoot);
+            }
+
+            if (handleRoot is not null)
+            {
+                var scoped = FindElementInRoot(handleRoot, target);
+                if (scoped is not null)
                 {
-                    return searchRoot;
+                    return scoped;
                 }
             }
-            catch { }
+
+            var fallback = FindWindowRootFromDesktop(hwnd, handleRoot ?? searchRoot);
+            return fallback is null ? null : FindElementInRoot(fallback, target);
         }
 
-        var all = searchRoot.FindAll(TreeScope.Descendants, Condition.TrueCondition).Cast<AutomationElement>();
+        return FindElementInRoot(searchRoot, target);
+    }
+
+    private static ActionResult SetRangeValue(AutomationElement element, RangeValuePattern rangePattern, string value)
+    {
+        var details = RangeDetails(element, rangePattern, value);
+        if (!TryParseFiniteDouble(value, out var numeric))
+        {
+            details["errorCode"] = "invalid_argument";
+            return new ActionResult("set-value", false, "UIAutomation.RangeValuePattern", ElementId(element), "RangeValue target requires a finite numeric value.", details);
+        }
+
+        details["requestedValue"] = numeric;
+        RangeValuePattern.RangeValuePatternInformation current;
+        try
+        {
+            current = rangePattern.Current;
+        }
+        catch (Exception ex)
+        {
+            details["errorCode"] = "uia_provider_error";
+            details["exceptionType"] = ex.GetType().Name;
+            return new ActionResult("set-value", false, "UIAutomation.RangeValuePattern", ElementId(element), ex.Message, details);
+        }
+
+        if (current.IsReadOnly)
+        {
+            details["errorCode"] = "read_only";
+            return new ActionResult("set-value", false, "UIAutomation.RangeValuePattern", ElementId(element), "RangeValue target is read-only.", details);
+        }
+
+        if (numeric < current.Minimum || numeric > current.Maximum)
+        {
+            details["errorCode"] = "out_of_range";
+            return new ActionResult("set-value", false, "UIAutomation.RangeValuePattern", ElementId(element), $"Value must be between {current.Minimum.ToString(CultureInfo.InvariantCulture)} and {current.Maximum.ToString(CultureInfo.InvariantCulture)}.", details);
+        }
+
+        try
+        {
+            rangePattern.SetValue(numeric);
+            details["value"] = numeric;
+            return new ActionResult("set-value", true, "UIAutomation.RangeValuePattern", ElementId(element), Details: details);
+        }
+        catch (ArgumentOutOfRangeException ex)
+        {
+            details["errorCode"] = "out_of_range";
+            return new ActionResult("set-value", false, "UIAutomation.RangeValuePattern", ElementId(element), ex.Message, details);
+        }
+        catch (Exception ex)
+        {
+            details["errorCode"] = "uia_provider_error";
+            details["exceptionType"] = ex.GetType().Name;
+            return new ActionResult("set-value", false, "UIAutomation.RangeValuePattern", ElementId(element), ex.Message, details);
+        }
+    }
+
+    private static AutomationElement? FindElementInRoot(AutomationElement searchRoot, TargetSpec target)
+    {
+        var all = EnumerateElements(searchRoot, includeRoot: true);
         if (target.AutomationId is not null)
             return all.FirstOrDefault(e => SafeString(e, AutomationElement.AutomationIdProperty).Equals(target.AutomationId, StringComparison.OrdinalIgnoreCase));
         if (target.Text is not null)
@@ -1413,12 +1512,40 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
         return null;
     }
 
-    private static ElementSnapshot? ToSnapshot(AutomationElement element, string prefix, int index, int depth)
+    private IReadOnlyList<ElementSnapshot> ReadTreeCore()
     {
+        var diagnostics = new UiaTraversalDiagnostics();
+        var state = new UiaTraversalState(MaxTotalElements);
+        var roots = FindChildren(RootElement(), diagnostics);
+        var snapshots = roots.Cast<AutomationElement>()
+            .Take(MaxChildrenPerNode)
+            .Select((element, index) => ToSnapshot(element, index, 0, state, diagnostics))
+            .Where(e => e is not null)
+            .Cast<ElementSnapshot>()
+            .ToList();
+
+        var limit = state.CreateLimitElement();
+        if (limit is not null)
+        {
+            snapshots.Add(limit);
+        }
+
+        return snapshots.Count == 0
+            ? new[] { DegradedElement("uia-empty", "UI Automation desktop root returned no elements.", "empty") }
+            : snapshots;
+    }
+
+    private static ElementSnapshot? ToSnapshot(AutomationElement element, int index, int depth, UiaTraversalState state, UiaTraversalDiagnostics diagnostics)
+    {
+        if (!state.TryEnter())
+        {
+            return null;
+        }
+
         try
         {
             var id = ElementId(element);
-            var children = depth >= MaxDepth ? Array.Empty<ElementSnapshot>() : Children(element, id, depth + 1);
+            var children = depth >= MaxDepth ? Array.Empty<ElementSnapshot>() : Children(element, depth + 1, state, diagnostics);
             return new ElementSnapshot(
                 id,
                 SafeName(element),
@@ -1430,27 +1557,35 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
                 Patterns(element),
                 children);
         }
-        catch
+        catch (Exception ex)
         {
-            return null;
+            return DegradedElement($"uia-degraded-{depth}-{index}", ex.Message, "element_serialization", ExceptionDetails(ex));
         }
     }
 
-    private static ElementSnapshot[] Children(AutomationElement element, string prefix, int depth)
+    private static ElementSnapshot[] Children(AutomationElement element, int depth, UiaTraversalState state, UiaTraversalDiagnostics diagnostics)
     {
         try
         {
-            return element.FindAll(TreeScope.Children, Condition.TrueCondition)
+            var children = FindChildren(element, diagnostics);
+            var snapshots = children
                 .Cast<AutomationElement>()
                 .Take(MaxChildrenPerNode)
-                .Select((child, index) => ToSnapshot(child, prefix, index, depth))
+                .Select((child, index) => ToSnapshot(child, index, depth, state, diagnostics))
                 .Where(e => e is not null)
                 .Cast<ElementSnapshot>()
-                .ToArray();
+                .ToList();
+            var limit = state.CreateLimitElement();
+            if (limit is not null)
+            {
+                snapshots.Add(limit);
+            }
+
+            return snapshots.ToArray();
         }
-        catch
+        catch (Exception ex)
         {
-            return Array.Empty<ElementSnapshot>();
+            return new[] { DegradedElement("uia-children-error", ex.Message, "children_exception", ExceptionDetails(ex)) };
         }
     }
 
@@ -1459,59 +1594,408 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
     private static string ElementId(AutomationElement element) => "uia-" + SafeInt(element, AutomationElement.NativeWindowHandleProperty) + "-" + SafeString(element, AutomationElement.AutomationIdProperty) + "-" + SafeName(element).GetHashCode(StringComparison.Ordinal);
     private static Bounds Bounds(AutomationElement element)
     {
-        var rect = element.Current.BoundingRectangle;
+        var rect = SafeProperty(element, AutomationElement.BoundingRectangleProperty) is System.Windows.Rect r
+            ? r
+            : System.Windows.Rect.Empty;
         if (rect.IsEmpty) return new Bounds(0, 0, 0, 0);
         return new Bounds((int)Math.Round(rect.X), (int)Math.Round(rect.Y), (int)Math.Round(rect.Width), (int)Math.Round(rect.Height));
     }
 
     private static string Role(AutomationElement element)
     {
-        try { return element.Current.ControlType.ProgrammaticName.Replace("ControlType.", "", StringComparison.Ordinal); }
+        try
+        {
+            return SafeProperty(element, AutomationElement.ControlTypeProperty) is ControlType controlType
+                ? controlType.ProgrammaticName.Replace("ControlType.", "", StringComparison.Ordinal)
+                : "unknown";
+        }
         catch { return "unknown"; }
     }
 
     private static IReadOnlyList<string> Patterns(AutomationElement element)
     {
+        return PatternNames(pattern => HasPattern(element, pattern));
+    }
+
+    internal static IReadOnlyList<string> PatternNames(Func<AutomationPattern, bool> hasPattern)
+    {
         var patterns = new List<string>();
-        AddPattern(element, InvokePattern.Pattern, "Invoke", patterns);
-        AddPattern(element, ValuePattern.Pattern, "Value", patterns);
-        AddPattern(element, TogglePattern.Pattern, "Toggle", patterns);
-        AddPattern(element, SelectionItemPattern.Pattern, "SelectionItem", patterns);
-        AddPattern(element, ExpandCollapsePattern.Pattern, "ExpandCollapse", patterns);
-        AddPattern(element, ScrollItemPattern.Pattern, "ScrollIntoView", patterns);
-        AddPattern(element, WindowPattern.Pattern, "Window", patterns);
+        AddPattern(hasPattern, InvokePattern.Pattern, "Invoke", patterns);
+        AddPattern(hasPattern, ValuePattern.Pattern, "Value", patterns);
+        AddPattern(hasPattern, RangeValuePattern.Pattern, "RangeValue", patterns);
+        AddPattern(hasPattern, TogglePattern.Pattern, "Toggle", patterns);
+        AddPattern(hasPattern, SelectionItemPattern.Pattern, "SelectionItem", patterns);
+        AddPattern(hasPattern, ExpandCollapsePattern.Pattern, "ExpandCollapse", patterns);
+        AddPattern(hasPattern, ScrollItemPattern.Pattern, "ScrollIntoView", patterns);
+        AddPattern(hasPattern, WindowPattern.Pattern, "Window", patterns);
         return patterns;
     }
 
-    private static void AddPattern(AutomationElement element, AutomationPattern pattern, string name, List<string> patterns)
+    internal static ElementSnapshot DegradedElement(string id, string message, string reason, IReadOnlyDictionary<string, object?>? details = null)
+    {
+        var metadata = new Dictionary<string, object?>
+        {
+            ["degraded"] = true,
+            ["degradationReason"] = reason,
+            ["message"] = message
+        };
+        if (details is not null)
+        {
+            metadata["details"] = details;
+        }
+
+        return new ElementSnapshot(
+            id,
+            message,
+            "degraded",
+            new Bounds(0, 0, 0, 0),
+            Enabled: false,
+            Patterns: new[] { "Degraded" },
+            Metadata: metadata);
+    }
+
+    private static void AddPattern(Func<AutomationPattern, bool> hasPattern, AutomationPattern pattern, string name, List<string> patterns)
     {
         try
         {
-            if (element.TryGetCurrentPattern(pattern, out _)) patterns.Add(name);
+            if (hasPattern(pattern)) patterns.Add(name);
         }
         catch { }
+    }
+
+    private static bool HasPattern(AutomationElement element, AutomationPattern pattern)
+    {
+        try
+        {
+            _ = element.GetCachedPattern(pattern);
+            return true;
+        }
+        catch { }
+
+        try
+        {
+            return element.TryGetCurrentPattern(pattern, out _);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool TryGetCurrentPattern<T>(AutomationElement element, AutomationPattern pattern, out T typed)
+        where T : class
+    {
+        typed = null!;
+        try
+        {
+            if (element.TryGetCurrentPattern(pattern, out var value) && value is T matched)
+            {
+                typed = matched;
+                return true;
+            }
+        }
+        catch { }
+
+        return false;
     }
 
     private static string SafeName(AutomationElement element) => SafeString(element, AutomationElement.NameProperty);
     private static string SafeString(AutomationElement element, AutomationProperty property)
     {
-        try { return element.GetCurrentPropertyValue(property, true) as string ?? ""; }
-        catch { return ""; }
+        return SafeProperty(element, property) as string ?? "";
     }
 
     private static bool SafeBool(AutomationElement element, AutomationProperty property)
     {
-        try { return element.GetCurrentPropertyValue(property, true) is bool b && b; }
-        catch { return false; }
+        return SafeProperty(element, property) is bool b && b;
     }
 
     private static int SafeInt(AutomationElement element, AutomationProperty property)
     {
-        try { return element.GetCurrentPropertyValue(property, true) is int i ? i : 0; }
-        catch { return 0; }
+        return SafeProperty(element, property) is int i ? i : 0;
     }
 
+    private static object? SafeProperty(AutomationElement element, AutomationProperty property)
+    {
+        try
+        {
+            var cached = element.GetCachedPropertyValue(property, true);
+            if (cached != AutomationElement.NotSupported)
+            {
+                return cached;
+            }
+        }
+        catch { }
+
+        try
+        {
+            var current = element.GetCurrentPropertyValue(property, true);
+            return current == AutomationElement.NotSupported ? null : current;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static bool ControlTypeEquals(AutomationElement element, ControlType controlType)
+    {
+        try
+        {
+            return SafeProperty(element, AutomationElement.ControlTypeProperty) is ControlType current && current == controlType;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static AutomationElement RootElement() => AutomationElement.RootElement;
+
+    private static AutomationElement? ElementFromHandle(IntPtr hwnd)
+    {
+        try
+        {
+            return hwnd == IntPtr.Zero ? null : AutomationElement.FromHandle(hwnd);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static AutomationElement? FindWindowRootFromDesktop(IntPtr requestedHwnd, AutomationElement currentRoot)
+    {
+        if (requestedHwnd == IntPtr.Zero || !Native.IsWindow(requestedHwnd))
+        {
+            return null;
+        }
+
+        var rootHwnd = Native.GetAncestor(requestedHwnd, Native.GaRoot);
+        if (rootHwnd == IntPtr.Zero)
+        {
+            rootHwnd = requestedHwnd;
+        }
+
+        Native.GetWindowThreadProcessId(rootHwnd, out var processId);
+        var currentId = ElementId(currentRoot);
+        var diagnostics = new UiaTraversalDiagnostics();
+        foreach (var candidate in FindChildren(RootElement(), diagnostics).Cast<AutomationElement>().Take(MaxChildrenPerNode))
+        {
+            if (ElementId(candidate).Equals(currentId, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (MatchesWindowRelationship(candidate, requestedHwnd, rootHwnd, processId))
+            {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool MatchesWindowRelationship(AutomationElement candidate, IntPtr requestedHwnd, IntPtr rootHwnd, int processId)
+    {
+        var candidateHwnd = new IntPtr(SafeInt(candidate, AutomationElement.NativeWindowHandleProperty));
+        var candidateProcessId = SafeInt(candidate, AutomationElement.ProcessIdProperty);
+        if (candidateHwnd == requestedHwnd || candidateHwnd == rootHwnd)
+        {
+            return true;
+        }
+
+        if (candidateHwnd == IntPtr.Zero || processId == 0 || candidateProcessId != processId)
+        {
+            return false;
+        }
+
+        var candidateRoot = Native.GetAncestor(candidateHwnd, Native.GaRoot);
+        if (candidateRoot == IntPtr.Zero)
+        {
+            candidateRoot = candidateHwnd;
+        }
+
+        return candidateRoot == rootHwnd ||
+            Native.IsChild(rootHwnd, candidateHwnd) ||
+            Native.IsChild(candidateHwnd, rootHwnd);
+    }
+
+    private static IEnumerable<AutomationElement> EnumerateElements(AutomationElement root, bool includeRoot)
+    {
+        var state = new UiaTraversalState(MaxTotalElements);
+        if (includeRoot && state.TryEnter())
+        {
+            yield return root;
+        }
+
+        var diagnostics = new UiaTraversalDiagnostics();
+        foreach (var element in EnumerateChildren(root, 0, state, diagnostics))
+        {
+            yield return element;
+        }
+    }
+
+    private static IEnumerable<AutomationElement> EnumerateChildren(AutomationElement root, int depth, UiaTraversalState state, UiaTraversalDiagnostics diagnostics)
+    {
+        if (depth >= MaxDepth || state.LimitReached)
+        {
+            yield break;
+        }
+
+        AutomationElementCollection children;
+        try
+        {
+            children = FindChildren(root, diagnostics);
+        }
+        catch
+        {
+            yield break;
+        }
+
+        foreach (var child in children.Cast<AutomationElement>().Take(MaxChildrenPerNode))
+        {
+            if (!state.TryEnter())
+            {
+                yield break;
+            }
+
+            yield return child;
+            foreach (var descendant in EnumerateChildren(child, depth + 1, state, diagnostics))
+            {
+                yield return descendant;
+            }
+        }
+    }
+
+    private static AutomationElementCollection FindChildren(AutomationElement element, UiaTraversalDiagnostics diagnostics)
+    {
+        try
+        {
+            var cache = CreateCacheRequest();
+            using (cache.Activate())
+            {
+                return element.FindAll(TreeScope.Children, Condition.TrueCondition);
+            }
+        }
+        catch (Exception ex)
+        {
+            diagnostics.CacheFallbacks++;
+            diagnostics.LastCacheError = ex.Message;
+            return element.FindAll(TreeScope.Children, Condition.TrueCondition);
+        }
+    }
+
+    private static CacheRequest CreateCacheRequest()
+    {
+        var cache = new CacheRequest
+        {
+            AutomationElementMode = AutomationElementMode.Full,
+            TreeFilter = Automation.RawViewCondition,
+            TreeScope = TreeScope.Element | TreeScope.Children
+        };
+        cache.Add(AutomationElement.NameProperty);
+        cache.Add(AutomationElement.ControlTypeProperty);
+        cache.Add(AutomationElement.BoundingRectangleProperty);
+        cache.Add(AutomationElement.AutomationIdProperty);
+        cache.Add(AutomationElement.IsEnabledProperty);
+        cache.Add(AutomationElement.HasKeyboardFocusProperty);
+        cache.Add(AutomationElement.NativeWindowHandleProperty);
+        cache.Add(AutomationElement.ProcessIdProperty);
+        cache.Add(InvokePattern.Pattern);
+        cache.Add(ValuePattern.Pattern);
+        cache.Add(RangeValuePattern.Pattern);
+        cache.Add(TogglePattern.Pattern);
+        cache.Add(SelectionItemPattern.Pattern);
+        cache.Add(ExpandCollapsePattern.Pattern);
+        cache.Add(ScrollItemPattern.Pattern);
+        cache.Add(WindowPattern.Pattern);
+        return cache;
+    }
+
+    private static Dictionary<string, object?> RangeDetails(AutomationElement element, RangeValuePattern rangePattern, string rawValue)
+    {
+        var details = PatternDetails(element).ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+        details["rawValue"] = rawValue;
+
+        try
+        {
+            var current = rangePattern.Current;
+            details["rangeValue"] = current.Value;
+            details["rangeMinimum"] = current.Minimum;
+            details["rangeMaximum"] = current.Maximum;
+            details["rangeSmallChange"] = current.SmallChange;
+            details["rangeLargeChange"] = current.LargeChange;
+            details["rangeIsReadOnly"] = current.IsReadOnly;
+        }
+        catch (Exception ex)
+        {
+            details["rangeError"] = ex.Message;
+            details["exceptionType"] = ex.GetType().Name;
+        }
+
+        return details;
+    }
+
+    private static bool TryParseFiniteDouble(string value, out double result)
+    {
+        if (!double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out result) &&
+            !double.TryParse(value, NumberStyles.Float, CultureInfo.CurrentCulture, out result))
+        {
+            return false;
+        }
+
+        return !double.IsNaN(result) && !double.IsInfinity(result);
+    }
+
+    private static IReadOnlyDictionary<string, object?> ExceptionDetails(Exception ex) => new Dictionary<string, object?>
+    {
+        ["exceptionType"] = ex.GetType().Name,
+        ["message"] = ex.Message
+    };
+
     private static ActionResult NotFound(string action, TargetSpec target) => new(action, false, "UIAutomation", target.ToString(), "Target was not found.");
+
+    private sealed class UiaTraversalState(int remaining)
+    {
+        private int remaining = remaining;
+        private bool limitReported;
+
+        public bool LimitReached { get; private set; }
+
+        public bool TryEnter()
+        {
+            if (remaining <= 0)
+            {
+                LimitReached = true;
+                return false;
+            }
+
+            remaining--;
+            return true;
+        }
+
+        public ElementSnapshot? CreateLimitElement()
+        {
+            if (!LimitReached || limitReported)
+            {
+                return null;
+            }
+
+            limitReported = true;
+            return DegradedElement(
+                "uia-limit",
+                $"UI Automation traversal stopped after {MaxTotalElements} elements.",
+                "element_limit",
+                new Dictionary<string, object?> { ["maxTotalElements"] = MaxTotalElements });
+        }
+    }
+
+    private sealed class UiaTraversalDiagnostics
+    {
+        public int CacheFallbacks { get; set; }
+        public string? LastCacheError { get; set; }
+    }
 }
 
 public sealed class WindowsOcrService : IWindowsOcrService

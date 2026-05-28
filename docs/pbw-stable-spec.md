@@ -97,7 +97,7 @@ diagnostics, `qualityStatus`, `captureBounds`, `win32Bounds`,
 `dwmExtendedFrameBounds`, `boundsSource`, `occluded`, `occlusionCheck`,
 `minimized`, and `noPixels`. Consumers must ignore unknown metadata keys.
 
-Elements include stable IDs, names, roles, bounds, automation IDs, state, supported patterns, and children.
+Elements include stable IDs, names, roles, bounds, automation IDs, state, supported patterns, children, and optional metadata. Element metadata is additive; consumers must ignore unknown keys. UI Automation degraded placeholder elements may set metadata keys such as `degraded`, `degradationReason`, `message`, and `details`.
 
 ## Safety and Configuration
 
@@ -115,6 +115,8 @@ The Windows layer should prefer native APIs in this order:
 6. OCR through Windows OCR where feasible, with a safe degraded no-op fallback.
 
 Unavailable capabilities must be reported through structured degraded results rather than raw exceptions.
+UI Automation tree reads use bounded cache requests for serialized element properties and common action patterns, falling back to uncached reads if providers reject cached access. Expensive tree reads are bounded by a timeout and may return a degraded placeholder element instead of blocking the whole snapshot path. Window-scoped UIA lookup may retry from the desktop root filtered by HWND/process relationship when a direct window root does not expose the requested descendants.
+Semantic `set-value` supports `ValuePattern` for text-like controls and `RangeValuePattern` for numeric range controls. RangeValue results include additive details such as requested value, current range bounds, and `errorCode` for invalid numeric values, read-only controls, out-of-range values, or provider errors.
 Background input that cannot be delivered safely is reported as
 `background_unavailable` with a reason and retry hint instead of silently sending
 foreground/global input.

@@ -39,6 +39,21 @@ public static class Program
         AutomationProperties.SetName(button, "WriteButton");
         button.Click += (_, _) => File.WriteAllText(outputPath, input.Text);
 
+        var slider = new Slider
+        {
+            Name = "RangeSlider",
+            Minimum = 0,
+            Maximum = 100,
+            Value = 25,
+            Width = 260,
+            Height = 32,
+            Margin = new Thickness(12),
+            TickFrequency = 5
+        };
+        AutomationProperties.SetAutomationId(slider, "RangeSlider");
+        AutomationProperties.SetName(slider, "RangeSlider");
+        slider.ValueChanged += (_, _) => File.WriteAllText(outputPath, "range:" + slider.Value.ToString("0"));
+
         var ocrText = new TextBlock
         {
             Text = "PBW OCR 12345",
@@ -53,13 +68,14 @@ public static class Program
         var panel = new StackPanel();
         panel.Children.Add(ocrText);
         panel.Children.Add(input);
+        panel.Children.Add(slider);
         panel.Children.Add(button);
 
         var window = new Window
         {
             Title = "pbw-integration-" + Environment.ProcessId,
             Width = 420,
-            Height = 240,
+            Height = 300,
             Content = panel,
             Topmost = false
         };

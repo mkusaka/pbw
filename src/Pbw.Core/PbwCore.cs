@@ -59,7 +59,8 @@ public sealed record ElementSnapshot(
     bool Enabled = true,
     bool Focused = false,
     IReadOnlyList<string>? Patterns = null,
-    IReadOnlyList<ElementSnapshot>? Children = null);
+    IReadOnlyList<ElementSnapshot>? Children = null,
+    IReadOnlyDictionary<string, object?>? Metadata = null);
 
 public sealed record OcrTextSnapshot(string Text, Bounds Bounds, double Confidence = 0);
 

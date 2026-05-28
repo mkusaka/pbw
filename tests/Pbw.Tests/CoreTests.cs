@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text.Json;
 using System.Windows;
+using System.Windows.Automation;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using Pbw.Cli;
@@ -496,6 +497,57 @@ public sealed class WindowsInputDispatchTests
     }
 }
 
+public sealed class WindowsUiaRobustnessTests
+{
+    [Fact]
+    public void WindowsElementAutomationService_PatternNames_Includes_RangeValue()
+    {
+        var patterns = WindowsElementAutomationService.PatternNames(pattern =>
+            pattern == RangeValuePattern.Pattern ||
+            pattern == ValuePattern.Pattern);
+
+        Assert.Contains("RangeValue", patterns);
+        Assert.Contains("Value", patterns);
+    }
+
+    [Fact]
+    public void WindowsElementAutomationService_ReadTree_Timeout_Returns_Degraded_Element()
+    {
+        var service = new WindowsElementAutomationService(
+            TimeSpan.FromMilliseconds(10),
+            () =>
+            {
+                Thread.Sleep(250);
+                return Array.Empty<ElementSnapshot>();
+            });
+
+        var element = Assert.Single(service.ReadTree());
+
+        Assert.Equal("uia-timeout", element.Id);
+        Assert.Equal("degraded", element.Role);
+        Assert.NotNull(element.Metadata);
+        Assert.True((bool)element.Metadata!["degraded"]!);
+        Assert.Equal("timeout", element.Metadata["degradationReason"]);
+    }
+
+    [Fact]
+    public void WindowsElementAutomationService_ReadTree_Exception_Returns_Degraded_Element()
+    {
+        var service = new WindowsElementAutomationService(
+            TimeSpan.FromSeconds(1),
+            () => throw new InvalidOperationException("provider failed"));
+
+        var element = Assert.Single(service.ReadTree());
+
+        Assert.Equal("uia-error", element.Id);
+        Assert.Equal("degraded", element.Role);
+        Assert.NotNull(element.Metadata);
+        Assert.Equal("exception", element.Metadata!["degradationReason"]);
+        var details = Assert.IsAssignableFrom<IReadOnlyDictionary<string, object?>>(element.Metadata["details"]);
+        Assert.Equal(nameof(InvalidOperationException), details["exceptionType"]);
+    }
+}
+
 public sealed class CliTests
 {
     [Fact]
@@ -896,6 +948,27 @@ public sealed class WindowsRealApiIntegrationTests
             Assert.Equal("UIAutomation.InvokePattern", invoke.Method);
 
             await WaitForAsync(() => File.Exists(outputPath) && File.ReadAllText(outputPath) == "from-real-uia", TimeSpan.FromSeconds(15));
+
+            var elements = automation.ReadTree();
+            var sliderSnapshot = new ElementMatcher().Find(elements, new TargetSpec(AutomationId: "RangeSlider"));
+            Assert.NotNull(sliderSnapshot);
+            Assert.Contains("RangeValue", sliderSnapshot!.Patterns ?? Array.Empty<string>());
+
+            var rangeSet = automation.SetValue(new TargetSpec(AutomationId: "RangeSlider", WindowHandle: handle), "73");
+            Assert.True(rangeSet.Performed, rangeSet.Message);
+            Assert.Equal("UIAutomation.RangeValuePattern", rangeSet.Method);
+            Assert.NotNull(rangeSet.Details);
+            Assert.Equal(73d, rangeSet.Details!["value"]);
+
+            await WaitForAsync(() => File.Exists(outputPath) && File.ReadAllText(outputPath) == "range:73", TimeSpan.FromSeconds(10));
+
+            var invalidRange = automation.SetValue(new TargetSpec(AutomationId: "RangeSlider", WindowHandle: handle), "not-a-number");
+            Assert.False(invalidRange.Performed);
+            Assert.Equal("invalid_argument", invalidRange.Details!["errorCode"]);
+
+            var outOfRange = automation.SetValue(new TargetSpec(AutomationId: "RangeSlider", WindowHandle: handle), "1000");
+            Assert.False(outOfRange.Performed);
+            Assert.Equal("out_of_range", outOfRange.Details!["errorCode"]);
 
             var capturePath = Path.Combine(Path.GetTempPath(), "pbw-capture-" + Guid.NewGuid().ToString("N") + ".bmp");
             var capture = new WindowsCaptureService().CaptureWindow(handle, capturePath, automation.ReadTree());
