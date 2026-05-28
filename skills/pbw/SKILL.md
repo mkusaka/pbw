@@ -58,7 +58,7 @@ Inspection and capture:
 - `pbw see`: capture desktop/window context, UI Automation tree, OCR text when available, and snapshot metadata.
 - `pbw image`: capture an image through Windows Graphics Capture where feasible, then PrintWindow/desktop crop fallbacks.
 - `pbw snapshot list|show|inspect|clean`: reuse and manage stored snapshots.
-- `pbw doctor`: report OS, UIA, capture, OCR, DPI/display, integrity, snapshot directory, config, and MCP feasibility.
+- `pbw doctor`: report OS, current session and Session 0 status, WinSta0/default desktop availability, foreground window availability, UIA, capture, OCR, DPI/display, integrity, snapshot directory, config, and MCP feasibility.
 
 Input and semantic actions:
 
