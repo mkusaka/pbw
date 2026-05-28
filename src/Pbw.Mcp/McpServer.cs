@@ -138,7 +138,7 @@ public sealed class McpServer
             "initialize" => Task.FromResult(Response(id, new Dictionary<string, object?>
             {
                 ["protocolVersion"] = "2024-11-05",
-                ["serverInfo"] = new Dictionary<string, object?> { ["name"] = "pbw", ["version"] = "0.1.0" },
+                ["serverInfo"] = new Dictionary<string, object?> { ["name"] = "pbw", ["version"] = "0.1.2" },
                 ["capabilities"] = new Dictionary<string, object?> { ["tools"] = new { }, ["resources"] = new { } }
             })),
             "tools/list" => Task.FromResult(Response(id, new Dictionary<string, object?> { ["tools"] = registry.ListTools() })),
