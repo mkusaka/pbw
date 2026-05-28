@@ -333,6 +333,7 @@ public interface IInputService
 public interface IElementAutomationService
 {
     IReadOnlyList<ElementSnapshot> ReadTree();
+    ActionResult Click(TargetSpec target);
     ActionResult SetValue(TargetSpec target, string value);
     ActionResult PerformAction(TargetSpec target, string action);
     IReadOnlyList<MenuItemInfo> ListMenus(TargetSpec target);
@@ -531,17 +532,28 @@ public sealed class ActionRouter(
     {
         if (target.X is not null && target.Y is not null)
         {
-            return input.Click(target.X.Value, target.Y.Value, dispatch: dispatch, windowHandle: target.WindowHandle);
+            var semantic = automation.Click(target);
+            if (semantic.Performed)
+            {
+                return WithDispatchDetails(semantic, dispatch, semantic: true);
+            }
+
+            return InputFallback(
+                () => input.Click(target.X.Value, target.Y.Value, dispatch: dispatch, windowHandle: target.WindowHandle),
+                semantic);
         }
 
         var element = await new TargetResolver(snapshotSource).ResolveAsync(target, cancellationToken).ConfigureAwait(false);
         if (element is null) throw new PbwException(new PbwError("target_not_found", "No element matched the target.", target.ToString()));
-        if (element.Patterns?.Any(p => p.Equals("Invoke", StringComparison.OrdinalIgnoreCase)) == true)
+        var semanticResult = automation.Click(target);
+        if (semanticResult.Performed)
         {
-            return WithDispatchDetails(automation.PerformAction(target, "invoke"), dispatch, semantic: true);
+            return WithDispatchDetails(semanticResult, dispatch, semantic: true);
         }
 
-        return input.Click(element.Bounds.CenterX, element.Bounds.CenterY, dispatch: dispatch, windowHandle: target.WindowHandle);
+        return InputFallback(
+            () => input.Click(element.Bounds.CenterX, element.Bounds.CenterY, dispatch: dispatch, windowHandle: target.WindowHandle),
+            semanticResult);
     }
 
     public ActionResult SetValue(TargetSpec target, string value) => automation.SetValue(target, value);
@@ -553,7 +565,48 @@ public sealed class ActionRouter(
         details["dispatch"] = InputDispatchPolicy.ToWireString(dispatch);
         details["actualDispatch"] = "semantic";
         details["semantic"] = semantic;
+        details["finalMethod"] = result.Method;
         return result with { Details = details };
+    }
+
+    private static ActionResult WithFallbackDetails(ActionResult result, ActionResult semanticAttempt)
+    {
+        var details = result.Details is null ? new Dictionary<string, object?>() : new Dictionary<string, object?>(result.Details);
+        AddFallbackDetails(details, semanticAttempt, result.Method);
+        return result with { Details = details };
+    }
+
+    private static ActionResult InputFallback(Func<ActionResult> fallback, ActionResult semanticAttempt)
+    {
+        try
+        {
+            return WithFallbackDetails(fallback(), semanticAttempt);
+        }
+        catch (PbwException ex)
+        {
+            var details = ex.Error.Details is null ? new Dictionary<string, object?>() : new Dictionary<string, object?>(ex.Error.Details);
+            AddFallbackDetails(details, semanticAttempt, ex.Error.Code);
+            throw new PbwException(ex.Error with { Details = details });
+        }
+    }
+
+    private static void AddFallbackDetails(Dictionary<string, object?> details, ActionResult semanticAttempt, string finalMethod)
+    {
+        details["semanticAttempted"] = true;
+        details["semanticPerformed"] = semanticAttempt.Performed;
+        details["semanticMethod"] = semanticAttempt.Method;
+        details["fallbackReason"] = SemanticFallbackReason(semanticAttempt);
+        details["finalMethod"] = finalMethod;
+    }
+
+    private static object? SemanticFallbackReason(ActionResult semanticAttempt)
+    {
+        if (semanticAttempt.Details is not null && semanticAttempt.Details.TryGetValue("fallbackReason", out var reason))
+        {
+            return reason;
+        }
+
+        return string.IsNullOrWhiteSpace(semanticAttempt.Message) ? "semantic_unavailable" : semanticAttempt.Message;
     }
 }
 

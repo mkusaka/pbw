@@ -41,7 +41,7 @@ public sealed class CoreTests
     }
 
     [Fact]
-    public async Task ActionRouter_Uses_Invoke_When_Available()
+    public async Task ActionRouter_Uses_Semantic_Click_When_Available()
     {
         var automation = new FakeAutomation();
         var router = new ActionRouter(new FakeInput(), automation, new FakeSnapshotSource());
@@ -49,11 +49,13 @@ public sealed class CoreTests
         var result = await router.ClickAsync(new TargetSpec(Id: "target"), InputDispatchMode.Background);
 
         Assert.True(result.Performed);
-        Assert.Equal("UIAutomation", result.Method);
-        Assert.Equal("invoke", automation.LastAction);
+        Assert.Equal("UIAutomation.InvokePattern", result.Method);
+        Assert.Equal("click", automation.LastAction);
         Assert.NotNull(result.Details);
         Assert.Equal("background", result.Details!["dispatch"]);
         Assert.Equal("semantic", result.Details["actualDispatch"]);
+        Assert.Equal("InvokePattern", result.Details["semanticPattern"]);
+        Assert.Equal("UIAutomation.InvokePattern", result.Details["finalMethod"]);
         Assert.True((bool)result.Details["semantic"]!);
     }
 
@@ -61,13 +63,53 @@ public sealed class CoreTests
     public async Task ActionRouter_Passes_Dispatch_To_Input_Fallback()
     {
         var input = new FakeInput();
-        var router = new ActionRouter(input, new FakeAutomation(), new FakeSnapshotSource());
+        var automation = new FakeAutomation { ClickResult = new ActionResult("click", false, "UIAutomation", Message: "not semantic", Details: new Dictionary<string, object?> { ["fallbackReason"] = "semantic_pattern_unavailable" }) };
+        var router = new ActionRouter(input, automation, new FakeSnapshotSource());
 
         var result = await router.ClickAsync(new TargetSpec(X: 11, Y: 22, WindowHandle: 1234), InputDispatchMode.Foreground);
 
         Assert.True(result.Performed);
         Assert.Equal(InputDispatchMode.Foreground, input.LastDispatch);
         Assert.Equal(1234, input.LastWindowHandle);
+        Assert.Equal(11, input.LastX);
+        Assert.Equal(22, input.LastY);
+        Assert.NotNull(result.Details);
+        Assert.True((bool)result.Details!["semanticAttempted"]!);
+        Assert.Equal("semantic_pattern_unavailable", result.Details["fallbackReason"]);
+        Assert.Equal("fake", result.Details["finalMethod"]);
+    }
+
+    [Fact]
+    public async Task ActionRouter_Coordinate_Click_Uses_HitTest_Semantic_Before_Input()
+    {
+        var input = new FakeInput();
+        var automation = new FakeAutomation();
+        var router = new ActionRouter(input, automation, new FakeSnapshotSource());
+
+        var result = await router.ClickAsync(new TargetSpec(X: 44, Y: 55), InputDispatchMode.Auto);
+
+        Assert.True(result.Performed);
+        Assert.Equal("UIAutomation.InvokePattern", result.Method);
+        Assert.Equal("click", automation.LastAction);
+        Assert.Equal(0, input.ClickCount);
+        Assert.Equal("semantic", result.Details!["actualDispatch"]);
+        Assert.Equal("InvokePattern", result.Details["semanticPattern"]);
+    }
+
+    [Fact]
+    public async Task ActionRouter_Element_Click_Fallback_Includes_Semantic_Reason()
+    {
+        var input = new FakeInput();
+        var automation = new FakeAutomation { ClickResult = new ActionResult("click", false, "UIAutomation", Message: "not semantic", Details: new Dictionary<string, object?> { ["fallbackReason"] = "semantic_pattern_unavailable" }) };
+        var router = new ActionRouter(input, automation, new FakeSnapshotSource());
+
+        var result = await router.ClickAsync(new TargetSpec(Id: "target"), InputDispatchMode.Auto);
+
+        Assert.True(result.Performed);
+        Assert.Equal(15, input.LastX);
+        Assert.Equal(11, input.LastY);
+        Assert.Equal("semantic_pattern_unavailable", result.Details!["fallbackReason"]);
+        Assert.Equal("UIAutomation", result.Details["semanticMethod"]);
     }
 
     [Theory]
@@ -601,6 +643,24 @@ public sealed class CliTests
     }
 
     [Fact]
+    public async Task Cli_Click_Element_Returns_Semantic_Action_Details()
+    {
+        var cli = TestCli();
+        var result = await cli.ExecuteAsync(new[] { "click", "--id", "target" });
+        using var doc = JsonDocument.Parse(result.Json);
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.True(doc.RootElement.GetProperty("ok").GetBoolean());
+        var data = doc.RootElement.GetProperty("data");
+        Assert.Equal("click", data.GetProperty("action").GetString());
+        Assert.Equal("UIAutomation.InvokePattern", data.GetProperty("method").GetString());
+        var details = data.GetProperty("details");
+        Assert.Equal("InvokePattern", details.GetProperty("semanticPattern").GetString());
+        Assert.Equal("UIAutomation.InvokePattern", details.GetProperty("finalMethod").GetString());
+        Assert.Equal("semantic", details.GetProperty("actualDispatch").GetString());
+    }
+
+    [Fact]
     public async Task Cli_Type_Text_Help_Executes_Input_Command()
     {
         var input = new FakeInput();
@@ -838,6 +898,29 @@ public sealed class McpTests
     }
 
     [Fact]
+    public async Task Mcp_Tool_Call_Preserves_Semantic_Action_Details()
+    {
+        var action = new ActionResult(
+            "click",
+            true,
+            "UIAutomation.InvokePattern",
+            Details: new Dictionary<string, object?>
+            {
+                ["semanticPattern"] = "InvokePattern",
+                ["finalMethod"] = "UIAutomation.InvokePattern"
+            });
+        var server = new McpServer(new McpToolRegistry(), new FakeExecutor(PbwEnvelope<object?>.Success(action)));
+
+        var json = await server.HandleJsonRpcAsync("""{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"click","arguments":{"id":"target"}}}""");
+        using var doc = JsonDocument.Parse(json);
+
+        Assert.False(doc.RootElement.GetProperty("result").GetProperty("isError").GetBoolean());
+        var text = doc.RootElement.GetProperty("result").GetProperty("content")[0].GetProperty("text").GetString();
+        Assert.Contains("\"semanticPattern\":\"InvokePattern\"", text);
+        Assert.Contains("\"finalMethod\":\"UIAutomation.InvokePattern\"", text);
+    }
+
+    [Fact]
     public async Task Mcp_Tool_Call_Forwards_Dispatch_Field()
     {
         var executor = new FakeExecutor();
@@ -933,6 +1016,8 @@ public sealed class WindowsRealApiIntegrationTests
             var windowService = new WindowsWindowService();
             var windows = windowService.ListWindows();
             Assert.Contains(windows, w => w.Handle == handle && w.Title.StartsWith("pbw-integration-", StringComparison.Ordinal));
+            var focus = windowService.Focus(handle);
+            Assert.True(focus.Performed, focus.Message);
 
             var backgroundDrag = Assert.Throws<PbwException>(() => new WindowsInputService().Drag(10, 10, 40, 40, InputDispatchMode.Background, handle));
             Assert.Equal("background_unavailable", backgroundDrag.Error.Code);
@@ -949,7 +1034,42 @@ public sealed class WindowsRealApiIntegrationTests
 
             await WaitForAsync(() => File.Exists(outputPath) && File.ReadAllText(outputPath) == "from-real-uia", TimeSpan.FromSeconds(15));
 
+            var toggle = automation.PerformAction(new TargetSpec(AutomationId: "ToggleBox", WindowHandle: handle), "toggle");
+            Assert.True(toggle.Performed, toggle.Message);
+            Assert.Equal("UIAutomation.TogglePattern", toggle.Method);
+            Assert.NotNull(toggle.Details);
+            Assert.Equal("TogglePattern", toggle.Details!["semanticPattern"]);
+
+            await WaitForAsync(() => File.Exists(outputPath) && File.ReadAllText(outputPath) == "toggle:true", TimeSpan.FromSeconds(10));
+
             var elements = automation.ReadTree();
+            var toggleSnapshot = new ElementMatcher().Find(elements, new TargetSpec(AutomationId: "ToggleBox"));
+            Assert.NotNull(toggleSnapshot);
+            Assert.Contains("Toggle", toggleSnapshot!.Patterns ?? Array.Empty<string>());
+
+            var router = new ActionRouter(new WindowsInputService(), automation, new StaticSnapshotSource(elements));
+            var routedSet = automation.SetValue(new TargetSpec(AutomationId: "InputBox", WindowHandle: handle), "from-router");
+            Assert.True(routedSet.Performed, routedSet.Message);
+            var routedInvoke = await router.ClickAsync(new TargetSpec(AutomationId: "WriteButton", WindowHandle: handle), InputDispatchMode.Auto);
+            Assert.True(routedInvoke.Performed, routedInvoke.Message);
+            Assert.Equal("UIAutomation.InvokePattern", routedInvoke.Method);
+            Assert.Equal("InvokePattern", routedInvoke.Details!["semanticPattern"]);
+            Assert.Equal("semantic", routedInvoke.Details["actualDispatch"]);
+            await WaitForAsync(() => File.Exists(outputPath) && File.ReadAllText(outputPath) == "from-router", TimeSpan.FromSeconds(10));
+
+            var routedToggle = await router.ClickAsync(new TargetSpec(AutomationId: "ToggleBox", WindowHandle: handle), InputDispatchMode.Auto);
+            Assert.True(routedToggle.Performed, routedToggle.Message);
+            Assert.Equal("UIAutomation.TogglePattern", routedToggle.Method);
+            Assert.Equal("TogglePattern", routedToggle.Details!["semanticPattern"]);
+            await WaitForAsync(() => File.Exists(outputPath) && File.ReadAllText(outputPath) == "toggle:false", TimeSpan.FromSeconds(10));
+
+            Assert.True(toggleSnapshot.Bounds.Width > 0 && toggleSnapshot.Bounds.Height > 0);
+            var routedHitTestToggle = await router.ClickAsync(new TargetSpec(X: toggleSnapshot.Bounds.CenterX, Y: toggleSnapshot.Bounds.CenterY, WindowHandle: handle), InputDispatchMode.Auto);
+            Assert.True(routedHitTestToggle.Performed, routedHitTestToggle.Message);
+            Assert.Equal("UIAutomation.TogglePattern", routedHitTestToggle.Method);
+            Assert.Equal("TogglePattern", routedHitTestToggle.Details!["semanticPattern"]);
+            await WaitForAsync(() => File.Exists(outputPath) && File.ReadAllText(outputPath) == "toggle:true", TimeSpan.FromSeconds(10));
+
             var sliderSnapshot = new ElementMatcher().Find(elements, new TargetSpec(AutomationId: "RangeSlider"));
             Assert.NotNull(sliderSnapshot);
             Assert.Contains("RangeValue", sliderSnapshot!.Patterns ?? Array.Empty<string>());
@@ -1114,14 +1234,28 @@ internal sealed class FakeSnapshotSource : ISnapshotSource
     }
 }
 
+internal sealed class StaticSnapshotSource(IReadOnlyList<ElementSnapshot> elements) : ISnapshotSource
+{
+    public Task<Snapshot> CaptureAsync(CancellationToken cancellationToken) =>
+        Task.FromResult(Snapshot.Empty("static") with { Elements = elements });
+}
+
 internal sealed class FakeInput : IInputService
 {
     public InputDispatchMode? LastDispatch { get; private set; }
     public int? LastWindowHandle { get; private set; }
+    public int? LastX { get; private set; }
+    public int? LastY { get; private set; }
+    public int ClickCount { get; private set; }
     public bool ThrowBackgroundUnavailable { get; init; }
 
-    public ActionResult Click(int x, int y, string button = "left", InputDispatchMode dispatch = InputDispatchMode.Auto, int? windowHandle = null) =>
-        Result("click", dispatch, windowHandle, new Dictionary<string, object?> { ["x"] = x, ["y"] = y, ["button"] = button });
+    public ActionResult Click(int x, int y, string button = "left", InputDispatchMode dispatch = InputDispatchMode.Auto, int? windowHandle = null)
+    {
+        LastX = x;
+        LastY = y;
+        ClickCount++;
+        return Result("click", dispatch, windowHandle, new Dictionary<string, object?> { ["x"] = x, ["y"] = y, ["button"] = button });
+    }
 
     public ActionResult Move(int x, int y, InputDispatchMode dispatch = InputDispatchMode.Auto, int? windowHandle = null) =>
         Result("move", dispatch, windowHandle, new Dictionary<string, object?> { ["x"] = x, ["y"] = y });
@@ -1218,7 +1352,21 @@ internal sealed record PostMessageCall(IntPtr Hwnd, uint Message, IntPtr WParam,
 internal sealed class FakeAutomation : IElementAutomationService
 {
     public string? LastAction { get; private set; }
+    public ActionResult? ClickResult { get; init; }
     public IReadOnlyList<ElementSnapshot> ReadTree() => Array.Empty<ElementSnapshot>();
+    public ActionResult Click(TargetSpec target)
+    {
+        LastAction = "click";
+        return ClickResult ?? new ActionResult(
+            "click",
+            true,
+            "UIAutomation.InvokePattern",
+            Details: new Dictionary<string, object?>
+            {
+                ["semanticPattern"] = "InvokePattern",
+                ["finalMethod"] = "UIAutomation.InvokePattern"
+            });
+    }
     public ActionResult SetValue(TargetSpec target, string value) => new("set-value", true, "UIAutomation");
     public ActionResult PerformAction(TargetSpec target, string action)
     {

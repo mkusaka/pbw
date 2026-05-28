@@ -75,6 +75,11 @@ details. Known dispatch detail keys include `dispatch`, `actualDispatch`,
 `eventKind`, `targetHwnd`, `rootHwnd`, `targetClass`, `foregroundChanged`,
 `foregroundRestored`, and optional `backgroundFallback`.
 
+Click and semantic action results may include additive routing diagnostics.
+Known semantic detail keys include `semanticPattern`, `semanticAttempted`,
+`semanticPerformed`, `semanticMethod`, `fallbackReason`, `finalMethod`, and
+optional `preActions`. Consumers must ignore unknown action result details.
+
 ## Snapshot Model
 
 Snapshots contain:
@@ -117,6 +122,7 @@ The Windows layer should prefer native APIs in this order:
 Unavailable capabilities must be reported through structured degraded results rather than raw exceptions.
 UI Automation tree reads use bounded cache requests for serialized element properties and common action patterns, falling back to uncached reads if providers reject cached access. Expensive tree reads are bounded by a timeout and may return a degraded placeholder element instead of blocking the whole snapshot path. Window-scoped UIA lookup may retry from the desktop root filtered by HWND/process relationship when a direct window root does not expose the requested descendants.
 Semantic `set-value` supports `ValuePattern` for text-like controls and `RangeValuePattern` for numeric range controls. RangeValue results include additive details such as requested value, current range bounds, and `errorCode` for invalid numeric values, read-only controls, out-of-range values, or provider errors.
+Element-targeted clicks and coordinate clicks prefer UI Automation hit-test and semantic click patterns before input dispatch. Semantic click routing tries `InvokePattern`, `TogglePattern`, `SelectionItemPattern`, and `ExpandCollapsePattern`; `ScrollItemPattern` may be used as a pre-action to bring the target into view. Input fallback reports the semantic fallback reason in additive action details.
 Background input that cannot be delivered safely is reported as
 `background_unavailable` with a reason and retry hint instead of silently sending
 foreground/global input.

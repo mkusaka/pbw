@@ -27,6 +27,20 @@ public static class Program
         AutomationProperties.SetAutomationId(input, "InputBox");
         AutomationProperties.SetName(input, "InputBox");
 
+        var toggle = new CheckBox
+        {
+            Name = "ToggleBox",
+            Content = "Toggle",
+            IsChecked = false,
+            Width = 260,
+            Height = 28,
+            Margin = new Thickness(12)
+        };
+        AutomationProperties.SetAutomationId(toggle, "ToggleBox");
+        AutomationProperties.SetName(toggle, "ToggleBox");
+        toggle.Checked += (_, _) => File.WriteAllText(outputPath, "toggle:true");
+        toggle.Unchecked += (_, _) => File.WriteAllText(outputPath, "toggle:false");
+
         var button = new Button
         {
             Name = "WriteButton",
@@ -68,6 +82,7 @@ public static class Program
         var panel = new StackPanel();
         panel.Children.Add(ocrText);
         panel.Children.Add(input);
+        panel.Children.Add(toggle);
         panel.Children.Add(slider);
         panel.Children.Add(button);
 
@@ -75,7 +90,7 @@ public static class Program
         {
             Title = "pbw-integration-" + Environment.ProcessId,
             Width = 420,
-            Height = 300,
+            Height = 340,
             Content = panel,
             Topmost = false
         };

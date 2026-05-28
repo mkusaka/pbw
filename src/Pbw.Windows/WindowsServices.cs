@@ -1266,6 +1266,13 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
         }
     }
 
+    public ActionResult Click(TargetSpec target)
+    {
+        var element = FindElement(target);
+        if (element is null) return NotFound("click", target);
+        return TrySemanticClick("click", element);
+    }
+
     public ActionResult SetValue(TargetSpec target, string value)
     {
         var element = FindElement(target);
@@ -1277,11 +1284,28 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
 
         if (TryGetCurrentPattern<ValuePattern>(element, ValuePattern.Pattern, out var valuePattern))
         {
-            valuePattern.SetValue(value);
-            return new ActionResult("set-value", true, "UIAutomation.ValuePattern", ElementId(element));
+            var details = SemanticDetails(element, "ValuePattern", "UIAutomation.ValuePattern");
+            details["valueLength"] = value.Length;
+            try
+            {
+                if (valuePattern.Current.IsReadOnly)
+                {
+                    details["errorCode"] = "read_only";
+                    return new ActionResult("set-value", false, "UIAutomation.ValuePattern", ElementId(element), "Value target is read-only.", details);
+                }
+
+                valuePattern.SetValue(value);
+                return new ActionResult("set-value", true, "UIAutomation.ValuePattern", ElementId(element), Details: details);
+            }
+            catch (Exception ex)
+            {
+                details["errorCode"] = "uia_provider_error";
+                details["exceptionType"] = ex.GetType().Name;
+                return new ActionResult("set-value", false, "UIAutomation.ValuePattern", ElementId(element), ex.Message, details);
+            }
         }
 
-        return new ActionResult("set-value", false, "UIAutomation", ElementId(element), "Target does not support ValuePattern.", PatternDetails(element));
+        return SemanticUnavailable("set-value", element, "Target does not support ValuePattern or RangeValuePattern.", "value_pattern_unavailable");
     }
 
     public ActionResult PerformAction(TargetSpec target, string action)
@@ -1294,53 +1318,60 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
             switch (normalized)
             {
                 case "invoke":
-                case "click":
-                    if (element.TryGetCurrentPattern(InvokePattern.Pattern, out var invoke) && invoke is InvokePattern invokePattern)
+                    if (TryGetCurrentPattern<InvokePattern>(element, InvokePattern.Pattern, out var invokePattern))
                     {
                         invokePattern.Invoke();
-                        return new ActionResult("perform-action", true, "UIAutomation.InvokePattern", ElementId(element));
+                        return SemanticSuccess("perform-action", element, "InvokePattern");
                     }
                     break;
+                case "click":
+                    return TrySemanticClick("perform-action", element);
                 case "toggle":
-                    if (element.TryGetCurrentPattern(TogglePattern.Pattern, out var toggle) && toggle is TogglePattern togglePattern)
+                    if (TryGetCurrentPattern<TogglePattern>(element, TogglePattern.Pattern, out var togglePattern))
                     {
                         togglePattern.Toggle();
-                        return new ActionResult("perform-action", true, "UIAutomation.TogglePattern", ElementId(element));
+                        return SemanticSuccess("perform-action", element, "TogglePattern");
                     }
                     break;
                 case "select":
-                    if (element.TryGetCurrentPattern(SelectionItemPattern.Pattern, out var select) && select is SelectionItemPattern selectionPattern)
+                    if (TryGetCurrentPattern<SelectionItemPattern>(element, SelectionItemPattern.Pattern, out var selectionPattern))
                     {
                         selectionPattern.Select();
-                        return new ActionResult("perform-action", true, "UIAutomation.SelectionItemPattern", ElementId(element));
+                        return SemanticSuccess("perform-action", element, "SelectionItemPattern");
                     }
                     break;
                 case "expand":
                 case "collapse":
-                    if (element.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out var expand) && expand is ExpandCollapsePattern expandPattern)
+                    if (TryGetCurrentPattern<ExpandCollapsePattern>(element, ExpandCollapsePattern.Pattern, out var expandPattern))
                     {
                         if (normalized == "expand") expandPattern.Expand(); else expandPattern.Collapse();
-                        return new ActionResult("perform-action", true, "UIAutomation.ExpandCollapsePattern", ElementId(element));
+                        return SemanticSuccess(
+                            "perform-action",
+                            element,
+                            "ExpandCollapsePattern",
+                            new Dictionary<string, object?> { ["expandCollapseAction"] = normalized });
                     }
                     break;
                 case "scroll-into-view":
-                    if (element.TryGetCurrentPattern(ScrollItemPattern.Pattern, out var scroll) && scroll is ScrollItemPattern scrollPattern)
+                case "scrollintoview":
+                    if (TryGetCurrentPattern<ScrollItemPattern>(element, ScrollItemPattern.Pattern, out var scrollPattern))
                     {
                         scrollPattern.ScrollIntoView();
-                        return new ActionResult("perform-action", true, "UIAutomation.ScrollItemPattern", ElementId(element));
+                        return SemanticSuccess("perform-action", element, "ScrollItemPattern");
                     }
                     break;
                 case "focus":
+                case "set-focus":
                     element.SetFocus();
-                    return new ActionResult("perform-action", true, "UIAutomation.SetFocus", ElementId(element));
+                    return SemanticSuccess("perform-action", element, "SetFocus");
             }
         }
         catch (Exception ex)
         {
-            return new ActionResult("perform-action", false, "UIAutomation", ElementId(element), ex.Message, PatternDetails(element));
+            return SemanticProviderError("perform-action", element, ex);
         }
 
-        return new ActionResult("perform-action", false, "UIAutomation", ElementId(element), $"Target does not support action '{action}'.", PatternDetails(element));
+        return SemanticUnavailable("perform-action", element, $"Target does not support action '{action}'.", "semantic_action_unavailable");
     }
 
     public IReadOnlyList<MenuItemInfo> ListMenus(TargetSpec target)
@@ -1410,13 +1441,202 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
         if (TryGetCurrentPattern<InvokePattern>(element, InvokePattern.Pattern, out var invoke))
         {
             invoke.Invoke();
-            return new ActionResult(action, true, "UIAutomation.InvokePattern", ElementId(element));
+            return SemanticSuccess(action, element, "InvokePattern");
         }
-        return new ActionResult(action, false, "UIAutomation", ElementId(element), "Target does not support InvokePattern.", PatternDetails(element));
+        return SemanticUnavailable(action, element, "Target does not support InvokePattern.", "invoke_pattern_unavailable");
     }
+
+    private static ActionResult TrySemanticClick(string action, AutomationElement element)
+    {
+        var extra = new Dictionary<string, object?>();
+        var preActions = new List<string>();
+        var providerErrors = new List<IReadOnlyDictionary<string, object?>>();
+        TryScrollIntoViewBeforeClick(element, preActions, providerErrors);
+        if (preActions.Count > 0)
+        {
+            extra["preActions"] = preActions;
+        }
+
+        if (TryGetCurrentPattern<InvokePattern>(element, InvokePattern.Pattern, out var invokePattern))
+        {
+            try
+            {
+                invokePattern.Invoke();
+                return SemanticSuccess(action, element, "InvokePattern", extra);
+            }
+            catch (Exception ex)
+            {
+                providerErrors.Add(SemanticPatternError("InvokePattern", ex));
+            }
+        }
+
+        if (TryGetCurrentPattern<TogglePattern>(element, TogglePattern.Pattern, out var togglePattern))
+        {
+            try
+            {
+                togglePattern.Toggle();
+                return SemanticSuccess(action, element, "TogglePattern", extra);
+            }
+            catch (Exception ex)
+            {
+                providerErrors.Add(SemanticPatternError("TogglePattern", ex));
+            }
+        }
+
+        if (TryGetCurrentPattern<SelectionItemPattern>(element, SelectionItemPattern.Pattern, out var selectionPattern))
+        {
+            try
+            {
+                selectionPattern.Select();
+                return SemanticSuccess(action, element, "SelectionItemPattern", extra);
+            }
+            catch (Exception ex)
+            {
+                providerErrors.Add(SemanticPatternError("SelectionItemPattern", ex));
+            }
+        }
+
+        if (TryGetCurrentPattern<ExpandCollapsePattern>(element, ExpandCollapsePattern.Pattern, out var expandPattern))
+        {
+            try
+            {
+                var expandAction = ToggleExpandCollapse(expandPattern);
+                if (expandAction is not null)
+                {
+                    extra["expandCollapseAction"] = expandAction;
+                    return SemanticSuccess(action, element, "ExpandCollapsePattern", extra);
+                }
+            }
+            catch (Exception ex)
+            {
+                providerErrors.Add(SemanticPatternError("ExpandCollapsePattern", ex));
+            }
+        }
+
+        if (providerErrors.Count > 0)
+        {
+            extra["providerErrors"] = providerErrors;
+            return SemanticUnavailable(action, element, "Semantic UI Automation click patterns failed; falling back to input dispatch.", "semantic_pattern_failed", extra);
+        }
+
+        return SemanticUnavailable(action, element, "Target does not expose a clickable UI Automation pattern.", "semantic_pattern_unavailable", extra);
+    }
+
+    private static void TryScrollIntoViewBeforeClick(
+        AutomationElement element,
+        ICollection<string> preActions,
+        ICollection<IReadOnlyDictionary<string, object?>> providerErrors)
+    {
+        if (!TryGetCurrentPattern<ScrollItemPattern>(element, ScrollItemPattern.Pattern, out var scrollPattern))
+        {
+            return;
+        }
+
+        try
+        {
+            scrollPattern.ScrollIntoView();
+            preActions.Add("ScrollItemPattern");
+        }
+        catch (Exception ex)
+        {
+            providerErrors.Add(SemanticPatternError("ScrollItemPattern", ex));
+        }
+    }
+
+    private static string? ToggleExpandCollapse(ExpandCollapsePattern expandPattern)
+    {
+        var state = expandPattern.Current.ExpandCollapseState;
+        if (state == ExpandCollapseState.LeafNode)
+        {
+            return null;
+        }
+
+        if (state == ExpandCollapseState.Expanded)
+        {
+            expandPattern.Collapse();
+            return "collapse";
+        }
+
+        expandPattern.Expand();
+        return "expand";
+    }
+
+    private static ActionResult SemanticSuccess(
+        string action,
+        AutomationElement element,
+        string semanticPattern,
+        IReadOnlyDictionary<string, object?>? extraDetails = null)
+    {
+        var method = SemanticMethod(semanticPattern);
+        return new ActionResult(action, true, method, ElementId(element), Details: SemanticDetails(element, semanticPattern, method, extraDetails));
+    }
+
+    private static ActionResult SemanticUnavailable(
+        string action,
+        AutomationElement element,
+        string message,
+        string fallbackReason,
+        IReadOnlyDictionary<string, object?>? extraDetails = null)
+    {
+        var details = SemanticDetails(element, null, "UIAutomation", extraDetails);
+        details["fallbackReason"] = fallbackReason;
+        return new ActionResult(action, false, "UIAutomation", ElementId(element), message, details);
+    }
+
+    private static ActionResult SemanticProviderError(string action, AutomationElement element, Exception ex)
+    {
+        var details = SemanticDetails(element, null, "UIAutomation");
+        details["fallbackReason"] = "uia_provider_error";
+        details["errorCode"] = "uia_provider_error";
+        details["exceptionType"] = ex.GetType().Name;
+        return new ActionResult(action, false, "UIAutomation", ElementId(element), ex.Message, details);
+    }
+
+    private static Dictionary<string, object?> SemanticDetails(
+        AutomationElement element,
+        string? semanticPattern,
+        string finalMethod,
+        IReadOnlyDictionary<string, object?>? extraDetails = null)
+    {
+        var details = PatternDetails(element).ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+        details["finalMethod"] = finalMethod;
+        if (semanticPattern is not null)
+        {
+            details["semanticPattern"] = semanticPattern;
+        }
+
+        if (extraDetails is not null)
+        {
+            foreach (var (key, value) in extraDetails)
+            {
+                details[key] = value;
+            }
+        }
+
+        return details;
+    }
+
+    private static IReadOnlyDictionary<string, object?> SemanticPatternError(string pattern, Exception ex) => new Dictionary<string, object?>
+    {
+        ["semanticPattern"] = pattern,
+        ["message"] = ex.Message,
+        ["exceptionType"] = ex.GetType().Name
+    };
+
+    private static string SemanticMethod(string semanticPattern) =>
+        semanticPattern == "SetFocus" ? "UIAutomation.SetFocus" : "UIAutomation." + semanticPattern;
 
     private AutomationElement? FindElement(TargetSpec target)
     {
+        if (target.X is not null && target.Y is not null)
+        {
+            var pointElement = ElementFromPoint(target.X.Value, target.Y.Value, target.WindowHandle);
+            if (pointElement is not null)
+            {
+                return pointElement;
+            }
+        }
+
         AutomationElement searchRoot = RootElement();
         if (target.WindowHandle is not null)
         {
@@ -1764,6 +1984,54 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
         }
     }
 
+    private static AutomationElement? ElementFromPoint(int x, int y, int? windowHandle)
+    {
+        try
+        {
+            var candidate = AutomationElement.FromPoint(new System.Windows.Point(x, y));
+            if (candidate is null || windowHandle is null)
+            {
+                return candidate;
+            }
+
+            var hwnd = new IntPtr(windowHandle.Value);
+            return ElementBelongsToWindowAtPoint(candidate, hwnd, x, y) ? candidate : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static bool ElementBelongsToWindowAtPoint(AutomationElement candidate, IntPtr requestedHwnd, int x, int y)
+    {
+        if (requestedHwnd == IntPtr.Zero || !Native.IsWindow(requestedHwnd))
+        {
+            return false;
+        }
+
+        var rootHwnd = Native.GetAncestor(requestedHwnd, Native.GaRoot);
+        if (rootHwnd == IntPtr.Zero)
+        {
+            rootHwnd = requestedHwnd;
+        }
+
+        Native.GetWindowThreadProcessId(rootHwnd, out var processId);
+        if (MatchesWindowRelationship(candidate, requestedHwnd, rootHwnd, processId))
+        {
+            return true;
+        }
+
+        var candidateProcessId = SafeInt(candidate, AutomationElement.ProcessIdProperty);
+        return processId != 0 &&
+            candidateProcessId == processId &&
+            Native.GetWindowRect(rootHwnd, out var rect) &&
+            x >= rect.Left &&
+            x <= rect.Right &&
+            y >= rect.Top &&
+            y <= rect.Bottom;
+    }
+
     private static AutomationElement? FindWindowRootFromDesktop(IntPtr requestedHwnd, AutomationElement currentRoot)
     {
         if (requestedHwnd == IntPtr.Zero || !Native.IsWindow(requestedHwnd))
@@ -1917,6 +2185,8 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
     {
         var details = PatternDetails(element).ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
         details["rawValue"] = rawValue;
+        details["semanticPattern"] = "RangeValuePattern";
+        details["finalMethod"] = "UIAutomation.RangeValuePattern";
 
         try
         {
