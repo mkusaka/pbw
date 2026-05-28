@@ -831,7 +831,18 @@ public sealed class MsaaFallbackTests
             TimeSpan.FromSeconds(1),
             () => Array.Empty<ElementSnapshot>(),
             msaa,
-            findElementCore: _ => AutomationElement.RootElement);
+            findElementCore: _ => null,
+            semanticClickCore: (action, _) => new ActionResult(
+                action,
+                false,
+                "UIAutomation",
+                "uia-button",
+                "Target does not expose a clickable UI Automation pattern.",
+                new Dictionary<string, object?>
+                {
+                    ["fallbackReason"] = "semantic_pattern_unavailable",
+                    ["finalMethod"] = "UIAutomation"
+                }));
 
         var result = service.PerformAction(new TargetSpec(Text: "Legacy OK", WindowHandle: 0x1234), "click");
 
@@ -865,6 +876,120 @@ public sealed class MsaaFallbackTests
         });
 }
 
+public sealed class WindowsDoctorCheckTests
+{
+    [Fact]
+    public void WindowsDoctorCheckService_Reports_Session0_As_Error()
+    {
+        var diagnostics = HealthyDoctorDiagnostics() with
+        {
+            Session = new WindowsSessionDiagnostics(true, 123, 0, 1, null)
+        };
+        var service = new WindowsDoctorCheckService(new FakeWindowsDoctorDiagnosticProvider(diagnostics));
+
+        var session = service.RunChecks(TestConfig()).Single(c => c.Name == "session");
+
+        Assert.Equal("error", session.Status);
+        Assert.NotNull(session.Details);
+        Assert.Equal(0, session.Details!["sessionId"]);
+        Assert.True((bool)session.Details["isSession0"]!);
+    }
+
+    [Fact]
+    public void WindowsDoctorCheckService_Reports_Desktop_Query_Warning()
+    {
+        var diagnostics = HealthyDoctorDiagnostics() with
+        {
+            Desktop = new WindowsDesktopDiagnostics(
+                true,
+                true,
+                false,
+                null,
+                5,
+                "Access is denied.",
+                true,
+                true,
+                "Default",
+                null,
+                null)
+        };
+        var service = new WindowsDoctorCheckService(new FakeWindowsDoctorDiagnosticProvider(diagnostics));
+
+        var desktop = service.RunChecks(TestConfig()).Single(c => c.Name == "interactiveDesktop");
+
+        Assert.Equal("warning", desktop.Status);
+        Assert.NotNull(desktop.Details);
+        var windowStation = Assert.IsAssignableFrom<IReadOnlyDictionary<string, object?>>(desktop.Details!["windowStation"]);
+        Assert.True((bool)windowStation["open"]!);
+        Assert.False((bool)windowStation["queried"]!);
+        Assert.Equal(5, windowStation["lastError"]);
+    }
+
+    [Fact]
+    public void WindowsDoctorCheckService_Reports_Capture_Fallback_Warning()
+    {
+        var diagnostics = HealthyDoctorDiagnostics() with
+        {
+            Capture = new WindowsCaptureDiagnostics(false, true, true, null)
+        };
+        var service = new WindowsDoctorCheckService(new FakeWindowsDoctorDiagnosticProvider(diagnostics));
+
+        var capture = service.RunChecks(TestConfig()).Single(c => c.Name == "capture");
+
+        Assert.Equal("warning", capture.Status);
+        Assert.Contains("PrintWindow", capture.Message);
+        Assert.NotNull(capture.Details);
+        Assert.False((bool)capture.Details!["windowsGraphicsCaptureSupported"]!);
+        Assert.True((bool)capture.Details["printWindowFallbackAvailable"]!);
+        Assert.True((bool)capture.Details["bitBltFallbackAvailable"]!);
+    }
+
+    [Fact]
+    public void WindowsDoctorCheckService_Maps_NonWindows_To_Structured_Warnings()
+    {
+        var diagnostics = HealthyDoctorDiagnostics() with
+        {
+            IsWindows = false,
+            OsDescription = "Linux test",
+            Session = new WindowsSessionDiagnostics(false, 123, null, null, "not_windows"),
+            Desktop = new WindowsDesktopDiagnostics(false, false, false, null, null, "not_windows", false, false, null, null, "not_windows"),
+            Foreground = new WindowsForegroundDiagnostics(false, IntPtr.Zero, null, null, "not_windows"),
+            Integrity = new WindowsIntegrityDiagnostics(false, null, null, "not_windows"),
+            Uia = new WindowsUiaDiagnostics(false, false, 2000, "not_windows"),
+            Capture = new WindowsCaptureDiagnostics(false, false, false, "not_windows"),
+            Ocr = new WindowsOcrDiagnostics(false, "not_windows"),
+            Dpi = new WindowsDpiDiagnostics(0, 0)
+        };
+        var service = new WindowsDoctorCheckService(new FakeWindowsDoctorDiagnosticProvider(diagnostics));
+
+        var checks = service.RunChecks(TestConfig());
+
+        Assert.Equal("warning", checks.Single(c => c.Name == "os").Status);
+        Assert.Equal("warning", checks.Single(c => c.Name == "session").Status);
+        Assert.Equal("warning", checks.Single(c => c.Name == "interactiveDesktop").Status);
+        Assert.Equal("warning", checks.Single(c => c.Name == "foreground").Status);
+        Assert.Equal("warning", checks.Single(c => c.Name == "uia").Status);
+    }
+
+    private static PbwConfig TestConfig()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "pbw-tests", Guid.NewGuid().ToString("N"));
+        return PbwConfig.Defaults(root);
+    }
+
+    internal static WindowsDoctorDiagnostics HealthyDoctorDiagnostics() => new(
+        true,
+        "Windows test",
+        new WindowsSessionDiagnostics(true, 123, 1, 1, null),
+        new WindowsDesktopDiagnostics(true, true, true, "WinSta0", null, null, true, true, "Default", null, null),
+        new WindowsForegroundDiagnostics(true, new IntPtr(0x1234), 567, "WindowClass", null),
+        new WindowsIntegrityDiagnostics(true, 0x00002000, "medium", null),
+        new WindowsUiaDiagnostics(true, false, 2000, null),
+        new WindowsCaptureDiagnostics(true, true, true, null),
+        new WindowsOcrDiagnostics(true, null),
+        new WindowsDpiDiagnostics(1920, 1080));
+}
+
 public sealed class CliTests
 {
     [Fact]
@@ -887,7 +1012,12 @@ public sealed class CliTests
         using var doc = JsonDocument.Parse(result.Json);
 
         Assert.Equal(0, result.ExitCode);
-        Assert.True(doc.RootElement.GetProperty("data").GetProperty("checks").GetArrayLength() > 0);
+        var checks = doc.RootElement.GetProperty("data").GetProperty("checks");
+        Assert.True(checks.GetArrayLength() > 0);
+        Assert.Contains(checks.EnumerateArray(), c => c.GetProperty("name").GetString() == "session");
+        var desktop = checks.EnumerateArray().Single(c => c.GetProperty("name").GetString() == "interactiveDesktop");
+        Assert.Equal("ok", desktop.GetProperty("status").GetString());
+        Assert.True(desktop.GetProperty("details").TryGetProperty("windowStation", out _));
     }
 
     [Fact]
@@ -1173,6 +1303,28 @@ public sealed class McpTests
     }
 
     [Fact]
+    public async Task Mcp_Doctor_Tool_Call_Returns_Structured_Check_Data()
+    {
+        var checks = new[]
+        {
+            new DoctorCheck(
+                "session",
+                "ok",
+                "session ok",
+                new Dictionary<string, object?> { ["sessionId"] = 1, ["isSession0"] = false })
+        };
+        var server = new McpServer(new McpToolRegistry(), new FakeExecutor(PbwEnvelope<object?>.Success(new { checks })));
+
+        var json = await server.HandleJsonRpcAsync("""{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"doctor","arguments":{}}}""");
+        using var doc = JsonDocument.Parse(json);
+
+        Assert.False(doc.RootElement.GetProperty("result").GetProperty("isError").GetBoolean());
+        var text = doc.RootElement.GetProperty("result").GetProperty("content")[0].GetProperty("text").GetString();
+        Assert.Contains("\"name\":\"session\"", text);
+        Assert.Contains("\"isSession0\":false", text);
+    }
+
+    [Fact]
     public async Task Mcp_Tool_Call_Preserves_Semantic_Action_Details()
     {
         var action = new ActionResult(
@@ -1255,6 +1407,38 @@ public sealed class WindowsIntegrationTests
         var service = new WindowsWindowService();
         var windows = service.ListWindows();
         Assert.NotNull(windows);
+    }
+
+    [Fact]
+    public void Doctor_Checks_Current_Windows_Session_And_Desktop_Diagnostics()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var config = PbwConfig.Defaults(Path.Combine(Path.GetTempPath(), "pbw-doctor-" + Guid.NewGuid().ToString("N")));
+        var checks = new WindowsDoctorCheckService().RunChecks(config);
+
+        foreach (var name in new[] { "session", "interactiveDesktop", "foreground", "integrity", "uia", "capture" })
+        {
+            var check = checks.Single(c => c.Name == name);
+            Assert.Contains(check.Status, new[] { "ok", "warning", "error" });
+            Assert.NotNull(check.Details);
+        }
+
+        var session = checks.Single(c => c.Name == "session");
+        Assert.True(session.Details!.ContainsKey("sessionId"));
+        Assert.True(session.Details.ContainsKey("isSession0"));
+
+        var desktop = checks.Single(c => c.Name == "interactiveDesktop");
+        Assert.True(desktop.Details!.ContainsKey("windowStation"));
+        Assert.True(desktop.Details.ContainsKey("desktop"));
+
+        var capture = checks.Single(c => c.Name == "capture");
+        Assert.True(capture.Details!.ContainsKey("windowsGraphicsCaptureSupported"));
+        Assert.True(capture.Details.ContainsKey("printWindowFallbackAvailable"));
+        Assert.True(capture.Details.ContainsKey("bitBltFallbackAvailable"));
     }
 }
 
@@ -1751,7 +1935,24 @@ internal sealed class FakeClipboard : IClipboardService
 
 internal sealed class FakeDoctor : IDoctorCheckService
 {
-    public IReadOnlyList<DoctorCheck> RunChecks(PbwConfig config) => new[] { new DoctorCheck("fake", "ok", "ok") };
+    public IReadOnlyList<DoctorCheck> RunChecks(PbwConfig config) => new[]
+    {
+        new DoctorCheck("session", "ok", "session ok", new Dictionary<string, object?> { ["sessionId"] = 1, ["isSession0"] = false }),
+        new DoctorCheck(
+            "interactiveDesktop",
+            "ok",
+            "desktop ok",
+            new Dictionary<string, object?>
+            {
+                ["windowStation"] = new Dictionary<string, object?> { ["name"] = "WinSta0", ["open"] = true },
+                ["desktop"] = new Dictionary<string, object?> { ["name"] = "Default", ["open"] = true }
+            })
+    };
+}
+
+internal sealed class FakeWindowsDoctorDiagnosticProvider(WindowsDoctorDiagnostics diagnostics) : IWindowsDoctorDiagnosticProvider
+{
+    public WindowsDoctorDiagnostics Collect() => diagnostics;
 }
 
 internal sealed class MetadataCaptureService(CaptureResult result) : IWindowsCaptureService

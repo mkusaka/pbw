@@ -1237,6 +1237,7 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
     private readonly TimeSpan msaaFallbackTimeout;
     private readonly Func<IReadOnlyList<ElementSnapshot>> readTreeCore;
     private readonly Func<TargetSpec, AutomationElement?> findElementCore;
+    private readonly Func<string, AutomationElement?, ActionResult>? semanticClickCore;
     private readonly IWindowsMsaaAutomationAdapter? msaa;
 
     public WindowsElementAutomationService()
@@ -1249,7 +1250,8 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
         Func<IReadOnlyList<ElementSnapshot>>? readTreeCore,
         IWindowsMsaaAutomationAdapter? msaa = null,
         TimeSpan? msaaFallbackTimeout = null,
-        Func<TargetSpec, AutomationElement?>? findElementCore = null)
+        Func<TargetSpec, AutomationElement?>? findElementCore = null,
+        Func<string, AutomationElement?, ActionResult>? semanticClickCore = null)
     {
         this.treeReadTimeout = treeReadTimeout <= TimeSpan.Zero ? DefaultTreeReadTimeout : treeReadTimeout;
         this.msaaFallbackTimeout = msaaFallbackTimeout is null || msaaFallbackTimeout <= TimeSpan.Zero
@@ -1257,6 +1259,7 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
             : msaaFallbackTimeout.Value;
         this.readTreeCore = readTreeCore ?? ReadTreeCore;
         this.findElementCore = findElementCore ?? FindElement;
+        this.semanticClickCore = semanticClickCore;
         this.msaa = msaa;
     }
 
@@ -1335,76 +1338,87 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
     public ActionResult PerformAction(TargetSpec target, string action)
     {
         var element = findElementCore(target);
-        if (element is null)
+        var normalized = action.ToLowerInvariant();
+        if (element is null && !(normalized == "click" && semanticClickCore is not null))
         {
             var notFound = NotFound("perform-action", target);
             return WithMsaaActionFallback(target, notFound, adapter => adapter.PerformAction(target, action));
         }
 
-        var normalized = action.ToLowerInvariant();
+        var uiaElement = element!;
         try
         {
             switch (normalized)
             {
                 case "invoke":
-                    if (TryGetCurrentPattern<InvokePattern>(element, InvokePattern.Pattern, out var invokePattern))
+                    if (TryGetCurrentPattern<InvokePattern>(uiaElement, InvokePattern.Pattern, out var invokePattern))
                     {
                         invokePattern.Invoke();
-                        return SemanticSuccess("perform-action", element, "InvokePattern");
+                        return SemanticSuccess("perform-action", uiaElement, "InvokePattern");
                     }
                     break;
                 case "click":
-                    var clickResult = TrySemanticClick("perform-action", element);
+                    var clickResult = semanticClickCore is null
+                        ? TrySemanticClick("perform-action", uiaElement)
+                        : semanticClickCore("perform-action", element);
                     return clickResult.Performed
                         ? clickResult
                         : WithMsaaActionFallback(target, clickResult, adapter => adapter.PerformAction(target, action));
                 case "toggle":
-                    if (TryGetCurrentPattern<TogglePattern>(element, TogglePattern.Pattern, out var togglePattern))
+                    if (TryGetCurrentPattern<TogglePattern>(uiaElement, TogglePattern.Pattern, out var togglePattern))
                     {
                         togglePattern.Toggle();
-                        return SemanticSuccess("perform-action", element, "TogglePattern");
+                        return SemanticSuccess("perform-action", uiaElement, "TogglePattern");
                     }
                     break;
                 case "select":
-                    if (TryGetCurrentPattern<SelectionItemPattern>(element, SelectionItemPattern.Pattern, out var selectionPattern))
+                    if (TryGetCurrentPattern<SelectionItemPattern>(uiaElement, SelectionItemPattern.Pattern, out var selectionPattern))
                     {
                         selectionPattern.Select();
-                        return SemanticSuccess("perform-action", element, "SelectionItemPattern");
+                        return SemanticSuccess("perform-action", uiaElement, "SelectionItemPattern");
                     }
                     break;
                 case "expand":
                 case "collapse":
-                    if (TryGetCurrentPattern<ExpandCollapsePattern>(element, ExpandCollapsePattern.Pattern, out var expandPattern))
+                    if (TryGetCurrentPattern<ExpandCollapsePattern>(uiaElement, ExpandCollapsePattern.Pattern, out var expandPattern))
                     {
                         if (normalized == "expand") expandPattern.Expand(); else expandPattern.Collapse();
                         return SemanticSuccess(
                             "perform-action",
-                            element,
+                            uiaElement,
                             "ExpandCollapsePattern",
                             new Dictionary<string, object?> { ["expandCollapseAction"] = normalized });
                     }
                     break;
                 case "scroll-into-view":
                 case "scrollintoview":
-                    if (TryGetCurrentPattern<ScrollItemPattern>(element, ScrollItemPattern.Pattern, out var scrollPattern))
+                    if (TryGetCurrentPattern<ScrollItemPattern>(uiaElement, ScrollItemPattern.Pattern, out var scrollPattern))
                     {
                         scrollPattern.ScrollIntoView();
-                        return SemanticSuccess("perform-action", element, "ScrollItemPattern");
+                        return SemanticSuccess("perform-action", uiaElement, "ScrollItemPattern");
                     }
                     break;
                 case "focus":
                 case "set-focus":
-                    element.SetFocus();
-                    return SemanticSuccess("perform-action", element, "SetFocus");
+                    uiaElement.SetFocus();
+                    return SemanticSuccess("perform-action", uiaElement, "SetFocus");
             }
         }
         catch (Exception ex)
         {
-            var providerError = SemanticProviderError("perform-action", element, ex);
+            var providerError = element is null
+                ? new ActionResult(
+                    "perform-action",
+                    false,
+                    "UIAutomation",
+                    target.ToString(),
+                    ex.Message,
+                    MergeDetails(ExceptionDetails(ex), new Dictionary<string, object?> { ["fallbackReason"] = "uia_provider_error" }))
+                : SemanticProviderError("perform-action", element, ex);
             return WithMsaaActionFallback(target, providerError, adapter => adapter.PerformAction(target, action));
         }
 
-        var unavailable = SemanticUnavailable("perform-action", element, $"Target does not support action '{action}'.", "semantic_action_unavailable");
+        var unavailable = SemanticUnavailable("perform-action", uiaElement, $"Target does not support action '{action}'.", "semantic_action_unavailable");
         return WithMsaaActionFallback(target, unavailable, adapter => adapter.PerformAction(target, action));
     }
 
@@ -4067,20 +4081,100 @@ internal interface IGraphicsCaptureItemInterop
     IntPtr CreateForMonitor(IntPtr monitor, ref Guid iid);
 }
 
+internal interface IWindowsDoctorDiagnosticProvider
+{
+    WindowsDoctorDiagnostics Collect();
+}
+
+internal sealed record WindowsDoctorDiagnostics(
+    bool IsWindows,
+    string OsDescription,
+    WindowsSessionDiagnostics Session,
+    WindowsDesktopDiagnostics Desktop,
+    WindowsForegroundDiagnostics Foreground,
+    WindowsIntegrityDiagnostics Integrity,
+    WindowsUiaDiagnostics Uia,
+    WindowsCaptureDiagnostics Capture,
+    WindowsOcrDiagnostics Ocr,
+    WindowsDpiDiagnostics Dpi);
+
+internal sealed record WindowsSessionDiagnostics(
+    bool Available,
+    int ProcessId,
+    int? SessionId,
+    uint? ActiveConsoleSessionId,
+    string? Error);
+
+internal sealed record WindowsDesktopDiagnostics(
+    bool UserInteractive,
+    bool WindowStationOpen,
+    bool WindowStationQueried,
+    string? WindowStationName,
+    int? WindowStationLastError,
+    string? WindowStationError,
+    bool DefaultDesktopOpen,
+    bool DefaultDesktopQueried,
+    string? DefaultDesktopName,
+    int? DefaultDesktopLastError,
+    string? DefaultDesktopError);
+
+internal sealed record WindowsForegroundDiagnostics(
+    bool Available,
+    IntPtr Hwnd,
+    int? ProcessId,
+    string? ClassName,
+    string? Error);
+
+internal sealed record WindowsIntegrityDiagnostics(
+    bool Available,
+    int? Rid,
+    string? Label,
+    string? Error);
+
+internal sealed record WindowsUiaDiagnostics(
+    bool Available,
+    bool TimedOut,
+    int TimeoutMs,
+    string? Error);
+
+internal sealed record WindowsCaptureDiagnostics(
+    bool WindowsGraphicsCaptureSupported,
+    bool PrintWindowFallbackAvailable,
+    bool BitBltFallbackAvailable,
+    string? Error);
+
+internal sealed record WindowsOcrDiagnostics(bool Available, string? Error);
+
+internal sealed record WindowsDpiDiagnostics(int SystemMetricsWidth, int SystemMetricsHeight);
+
 public sealed class WindowsDoctorCheckService : IDoctorCheckService
 {
+    private readonly IWindowsDoctorDiagnosticProvider provider;
+
+    public WindowsDoctorCheckService()
+        : this(new NativeWindowsDoctorDiagnosticProvider())
+    {
+    }
+
+    internal WindowsDoctorCheckService(IWindowsDoctorDiagnosticProvider provider)
+    {
+        this.provider = provider;
+    }
+
     public IReadOnlyList<DoctorCheck> RunChecks(PbwConfig config)
     {
+        var diagnostics = CollectDiagnostics();
         var checks = new List<DoctorCheck>
         {
-            new("os", RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "ok" : "warning", RuntimeInformation.OSDescription),
-            new("uia", "ok", "UI Automation tree reading and common patterns are available."),
-            new("capture", "ok", GraphicsCaptureSession.IsSupported()
-                ? "Windows.Graphics.Capture window capture is available; PrintWindow and BitBlt fallbacks are available."
-                : "Windows.Graphics.Capture is unavailable; PrintWindow and BitBlt fallbacks are available."),
-            new("ocr", OcrEngine.TryCreateFromUserProfileLanguages() is null ? "warning" : "ok", OcrEngine.TryCreateFromUserProfileLanguages() is null ? "Windows OCR engine is unavailable for the current user languages." : "Windows OCR engine is available."),
-            new("dpi", "ok", "Coordinate converter uses display scale metadata.", new Dictionary<string, object?> { ["systemMetricsWidth"] = Native.GetSystemMetrics(0), ["systemMetricsHeight"] = Native.GetSystemMetrics(1) }),
-            new("integrity", "ok", "Integrity level check is not elevated-specific in this build."),
+            OsCheck(diagnostics),
+            SessionCheck(diagnostics),
+            InteractiveDesktopCheck(diagnostics),
+            ForegroundCheck(diagnostics),
+            IntegrityCheck(diagnostics),
+            UiaCheck(diagnostics),
+            CaptureCheck(diagnostics),
+            OcrCheck(diagnostics),
+            DpiCheck(diagnostics),
             new("mcp", config.Mcp.StdioEnabled && !config.Mcp.RemoteListenerEnabled ? "ok" : "error", "MCP stdio transport configured; remote listener disabled.")
         };
         try
@@ -4100,6 +4194,536 @@ public sealed class WindowsDoctorCheckService : IDoctorCheckService
         checks.Add(new DoctorCheck("config", validation.Valid ? "ok" : "error", validation.Valid ? "Config is valid." : string.Join("; ", validation.Errors)));
         return checks;
     }
+
+    private WindowsDoctorDiagnostics CollectDiagnostics()
+    {
+        try
+        {
+            return provider.Collect();
+        }
+        catch (Exception ex)
+        {
+            var isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+            return new WindowsDoctorDiagnostics(
+                isWindows,
+                RuntimeInformation.OSDescription,
+                new WindowsSessionDiagnostics(false, Environment.ProcessId, null, null, ex.Message),
+                new WindowsDesktopDiagnostics(Environment.UserInteractive, false, false, null, null, ex.Message, false, false, null, null, ex.Message),
+                new WindowsForegroundDiagnostics(false, IntPtr.Zero, null, null, ex.Message),
+                new WindowsIntegrityDiagnostics(false, null, null, ex.Message),
+                new WindowsUiaDiagnostics(false, false, 0, ex.Message),
+                new WindowsCaptureDiagnostics(false, isWindows, isWindows, ex.Message),
+                new WindowsOcrDiagnostics(false, ex.Message),
+                new WindowsDpiDiagnostics(0, 0));
+        }
+    }
+
+    private static DoctorCheck OsCheck(WindowsDoctorDiagnostics diagnostics) => new(
+        "os",
+        diagnostics.IsWindows ? "ok" : "warning",
+        diagnostics.OsDescription,
+        new Dictionary<string, object?> { ["isWindows"] = diagnostics.IsWindows });
+
+    private static DoctorCheck SessionCheck(WindowsDoctorDiagnostics diagnostics)
+    {
+        var session = diagnostics.Session;
+        var isSession0 = session.SessionId == 0;
+        var status = !diagnostics.IsWindows || !session.Available
+            ? "warning"
+            : isSession0 ? "error" : "ok";
+        var message = status switch
+        {
+            "ok" => $"Current process is running in session {session.SessionId}.",
+            "error" => "Current process is running in Session 0; interactive desktop automation will not work here.",
+            _ => session.Error ?? "Current process session id could not be determined."
+        };
+
+        return new DoctorCheck("session", status, message, new Dictionary<string, object?>
+        {
+            ["processId"] = session.ProcessId,
+            ["sessionId"] = session.SessionId,
+            ["isSession0"] = isSession0,
+            ["activeConsoleSessionId"] = session.ActiveConsoleSessionId,
+            ["error"] = session.Error
+        });
+    }
+
+    private static DoctorCheck InteractiveDesktopCheck(WindowsDoctorDiagnostics diagnostics)
+    {
+        var desktop = diagnostics.Desktop;
+        var open = desktop.WindowStationOpen && desktop.DefaultDesktopOpen;
+        var queried = desktop.WindowStationQueried && desktop.DefaultDesktopQueried;
+        var status = !diagnostics.IsWindows
+            ? "warning"
+            : !open ? "error" : !queried || !desktop.UserInteractive ? "warning" : "ok";
+        var message = status switch
+        {
+            "ok" => "WinSta0 and the Default desktop are openable and queryable.",
+            "error" => "WinSta0 or the Default desktop could not be opened; GUI automation is unavailable from this process.",
+            _ when open && !desktop.UserInteractive => "The interactive desktop is openable, but the process is not marked user-interactive.",
+            _ => "WinSta0 or the Default desktop opened, but query details were not fully available."
+        };
+
+        return new DoctorCheck("interactiveDesktop", status, message, new Dictionary<string, object?>
+        {
+            ["userInteractive"] = desktop.UserInteractive,
+            ["windowStation"] = new Dictionary<string, object?>
+            {
+                ["name"] = desktop.WindowStationName,
+                ["open"] = desktop.WindowStationOpen,
+                ["queried"] = desktop.WindowStationQueried,
+                ["lastError"] = desktop.WindowStationLastError,
+                ["error"] = desktop.WindowStationError
+            },
+            ["desktop"] = new Dictionary<string, object?>
+            {
+                ["name"] = desktop.DefaultDesktopName,
+                ["open"] = desktop.DefaultDesktopOpen,
+                ["queried"] = desktop.DefaultDesktopQueried,
+                ["lastError"] = desktop.DefaultDesktopLastError,
+                ["error"] = desktop.DefaultDesktopError
+            }
+        });
+    }
+
+    private static DoctorCheck ForegroundCheck(WindowsDoctorDiagnostics diagnostics)
+    {
+        var foreground = diagnostics.Foreground;
+        var status = diagnostics.IsWindows && foreground.Available ? "ok" : "warning";
+        var message = foreground.Available
+            ? "A foreground window is available on the current desktop."
+            : foreground.Error ?? "No foreground window is available; the desktop may be locked, headless, or non-interactive.";
+        return new DoctorCheck("foreground", status, message, new Dictionary<string, object?>
+        {
+            ["available"] = foreground.Available,
+            ["hwnd"] = foreground.Hwnd == IntPtr.Zero ? null : FormatHwnd(foreground.Hwnd),
+            ["processId"] = foreground.ProcessId,
+            ["className"] = foreground.ClassName,
+            ["error"] = foreground.Error
+        });
+    }
+
+    private static DoctorCheck IntegrityCheck(WindowsDoctorDiagnostics diagnostics)
+    {
+        var integrity = diagnostics.Integrity;
+        var lowIntegrity = integrity.Rid is not null && integrity.Rid < 0x00002000;
+        var status = !diagnostics.IsWindows || !integrity.Available || lowIntegrity ? "warning" : "ok";
+        var message = integrity.Available
+            ? $"Current process integrity level is {integrity.Label ?? "unknown"}."
+            : integrity.Error ?? "Current process integrity level could not be determined.";
+        return new DoctorCheck("integrity", status, message, new Dictionary<string, object?>
+        {
+            ["available"] = integrity.Available,
+            ["rid"] = integrity.Rid,
+            ["label"] = integrity.Label,
+            ["error"] = integrity.Error
+        });
+    }
+
+    private static DoctorCheck UiaCheck(WindowsDoctorDiagnostics diagnostics)
+    {
+        var uia = diagnostics.Uia;
+        var status = diagnostics.IsWindows && uia.Available ? "ok" : "warning";
+        var message = uia.Available
+            ? "UI Automation root element smoke check succeeded."
+            : uia.TimedOut
+                ? "UI Automation smoke check timed out."
+                : uia.Error ?? "UI Automation smoke check did not complete successfully.";
+        return new DoctorCheck("uia", status, message, new Dictionary<string, object?>
+        {
+            ["available"] = uia.Available,
+            ["timedOut"] = uia.TimedOut,
+            ["timeoutMs"] = uia.TimeoutMs,
+            ["error"] = uia.Error
+        });
+    }
+
+    private static DoctorCheck CaptureCheck(WindowsDoctorDiagnostics diagnostics)
+    {
+        var capture = diagnostics.Capture;
+        var hasFallback = capture.PrintWindowFallbackAvailable && capture.BitBltFallbackAvailable;
+        var status = !diagnostics.IsWindows
+            ? "warning"
+            : capture.WindowsGraphicsCaptureSupported ? "ok" : hasFallback ? "warning" : "error";
+        var message = capture.WindowsGraphicsCaptureSupported
+            ? "Windows.Graphics.Capture is available; PrintWindow and BitBlt fallbacks are available."
+            : hasFallback
+                ? "Windows.Graphics.Capture is unavailable; PrintWindow and BitBlt fallbacks are available."
+                : capture.Error ?? "No usable capture backend was detected.";
+        return new DoctorCheck("capture", status, message, new Dictionary<string, object?>
+        {
+            ["windowsGraphicsCaptureSupported"] = capture.WindowsGraphicsCaptureSupported,
+            ["printWindowFallbackAvailable"] = capture.PrintWindowFallbackAvailable,
+            ["bitBltFallbackAvailable"] = capture.BitBltFallbackAvailable,
+            ["error"] = capture.Error
+        });
+    }
+
+    private static DoctorCheck OcrCheck(WindowsDoctorDiagnostics diagnostics)
+    {
+        var ocr = diagnostics.Ocr;
+        return new DoctorCheck(
+            "ocr",
+            ocr.Available ? "ok" : "warning",
+            ocr.Available ? "Windows OCR engine is available." : ocr.Error ?? "Windows OCR engine is unavailable for the current user languages.",
+            new Dictionary<string, object?> { ["available"] = ocr.Available, ["error"] = ocr.Error });
+    }
+
+    private static DoctorCheck DpiCheck(WindowsDoctorDiagnostics diagnostics)
+    {
+        var dpi = diagnostics.Dpi;
+        var valid = dpi.SystemMetricsWidth > 0 && dpi.SystemMetricsHeight > 0;
+        return new DoctorCheck(
+            "dpi",
+            valid ? "ok" : "warning",
+            valid ? "Coordinate converter uses display scale metadata." : "Display system metrics are unavailable.",
+            new Dictionary<string, object?> { ["systemMetricsWidth"] = dpi.SystemMetricsWidth, ["systemMetricsHeight"] = dpi.SystemMetricsHeight });
+    }
+
+    private static string FormatHwnd(IntPtr hwnd) => "0x" + hwnd.ToInt64().ToString("x");
+}
+
+internal sealed class NativeWindowsDoctorDiagnosticProvider : IWindowsDoctorDiagnosticProvider
+{
+    private const uint NoActiveConsoleSession = 0xFFFFFFFF;
+    private const uint WindowStationReadAttributes = 0x0002;
+    private const uint WindowStationEnumerateDesktops = 0x0001;
+    private const uint DesktopReadObjects = 0x0001;
+    private const uint DesktopEnumerate = 0x0040;
+    private const int UoiName = 2;
+    private const uint TokenQuery = 0x0008;
+    private const int TokenIntegrityLevel = 25;
+    private const int UiaTimeoutMs = 2000;
+
+    public WindowsDoctorDiagnostics Collect()
+    {
+        var isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+        return new WindowsDoctorDiagnostics(
+            isWindows,
+            RuntimeInformation.OSDescription,
+            Session(isWindows),
+            Desktop(isWindows),
+            Foreground(isWindows),
+            Integrity(isWindows),
+            Uia(isWindows),
+            Capture(isWindows),
+            Ocr(isWindows),
+            Dpi(isWindows));
+    }
+
+    private static WindowsSessionDiagnostics Session(bool isWindows)
+    {
+        if (!isWindows)
+        {
+            return new WindowsSessionDiagnostics(false, Environment.ProcessId, null, null, "not_windows");
+        }
+
+        try
+        {
+            var ok = Native.ProcessIdToSessionId(Environment.ProcessId, out var sessionId);
+            var active = Native.WTSGetActiveConsoleSessionId();
+            return ok
+                ? new WindowsSessionDiagnostics(true, Environment.ProcessId, sessionId, active == NoActiveConsoleSession ? null : active, null)
+                : new WindowsSessionDiagnostics(false, Environment.ProcessId, null, active == NoActiveConsoleSession ? null : active, LastWin32Error());
+        }
+        catch (Exception ex)
+        {
+            return new WindowsSessionDiagnostics(false, Environment.ProcessId, null, null, ex.Message);
+        }
+    }
+
+    private static WindowsDesktopDiagnostics Desktop(bool isWindows)
+    {
+        if (!isWindows)
+        {
+            return new WindowsDesktopDiagnostics(Environment.UserInteractive, false, false, null, null, "not_windows", false, false, null, null, "not_windows");
+        }
+
+        var station = ProbeWindowStation();
+        var desktop = ProbeDefaultDesktop();
+        return new WindowsDesktopDiagnostics(
+            Environment.UserInteractive,
+            station.Open,
+            station.Queried,
+            station.Name,
+            station.LastError,
+            station.Error,
+            desktop.Open,
+            desktop.Queried,
+            desktop.Name,
+            desktop.LastError,
+            desktop.Error);
+    }
+
+    private static WindowsForegroundDiagnostics Foreground(bool isWindows)
+    {
+        if (!isWindows)
+        {
+            return new WindowsForegroundDiagnostics(false, IntPtr.Zero, null, null, "not_windows");
+        }
+
+        try
+        {
+            var hwnd = Native.GetForegroundWindow();
+            if (hwnd == IntPtr.Zero)
+            {
+                return new WindowsForegroundDiagnostics(false, IntPtr.Zero, null, null, "GetForegroundWindow returned null.");
+            }
+
+            Native.GetWindowThreadProcessId(hwnd, out var processId);
+            return new WindowsForegroundDiagnostics(true, hwnd, processId, ClassName(hwnd), null);
+        }
+        catch (Exception ex)
+        {
+            return new WindowsForegroundDiagnostics(false, IntPtr.Zero, null, null, ex.Message);
+        }
+    }
+
+    private static WindowsIntegrityDiagnostics Integrity(bool isWindows)
+    {
+        if (!isWindows)
+        {
+            return new WindowsIntegrityDiagnostics(false, null, null, "not_windows");
+        }
+
+        IntPtr token = IntPtr.Zero;
+        IntPtr buffer = IntPtr.Zero;
+        try
+        {
+            if (!Native.OpenProcessToken(Native.GetCurrentProcess(), TokenQuery, out token))
+            {
+                return new WindowsIntegrityDiagnostics(false, null, null, LastWin32Error());
+            }
+
+            Native.GetTokenInformation(token, TokenIntegrityLevel, IntPtr.Zero, 0, out var length);
+            if (length <= 0)
+            {
+                return new WindowsIntegrityDiagnostics(false, null, null, LastWin32Error());
+            }
+
+            buffer = Marshal.AllocHGlobal(length);
+            if (!Native.GetTokenInformation(token, TokenIntegrityLevel, buffer, length, out _))
+            {
+                return new WindowsIntegrityDiagnostics(false, null, null, LastWin32Error());
+            }
+
+            var label = Marshal.PtrToStructure<TOKEN_MANDATORY_LABEL>(buffer);
+            var countPtr = Native.GetSidSubAuthorityCount(label.Label.Sid);
+            if (countPtr == IntPtr.Zero)
+            {
+                return new WindowsIntegrityDiagnostics(false, null, null, "GetSidSubAuthorityCount returned null.");
+            }
+
+            var count = Marshal.ReadByte(countPtr);
+            if (count == 0)
+            {
+                return new WindowsIntegrityDiagnostics(false, null, null, "Integrity SID has no sub-authorities.");
+            }
+
+            var ridPtr = Native.GetSidSubAuthority(label.Label.Sid, count - 1);
+            if (ridPtr == IntPtr.Zero)
+            {
+                return new WindowsIntegrityDiagnostics(false, null, null, "GetSidSubAuthority returned null.");
+            }
+
+            var rid = Marshal.ReadInt32(ridPtr);
+            return new WindowsIntegrityDiagnostics(true, rid, IntegrityLabel(rid), null);
+        }
+        catch (Exception ex)
+        {
+            return new WindowsIntegrityDiagnostics(false, null, null, ex.Message);
+        }
+        finally
+        {
+            if (buffer != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+
+            if (token != IntPtr.Zero)
+            {
+                Native.CloseHandle(token);
+            }
+        }
+    }
+
+    private static WindowsUiaDiagnostics Uia(bool isWindows)
+    {
+        if (!isWindows)
+        {
+            return new WindowsUiaDiagnostics(false, false, UiaTimeoutMs, "not_windows");
+        }
+
+        try
+        {
+            var task = Task.Run(() =>
+            {
+                var root = AutomationElement.RootElement;
+                _ = root.Current.ControlType;
+            });
+            if (!task.Wait(TimeSpan.FromMilliseconds(UiaTimeoutMs)))
+            {
+                return new WindowsUiaDiagnostics(false, true, UiaTimeoutMs, "UI Automation smoke check timed out.");
+            }
+
+            task.GetAwaiter().GetResult();
+            return new WindowsUiaDiagnostics(true, false, UiaTimeoutMs, null);
+        }
+        catch (AggregateException ex)
+        {
+            return new WindowsUiaDiagnostics(false, false, UiaTimeoutMs, (ex.Flatten().InnerException ?? ex).Message);
+        }
+        catch (Exception ex)
+        {
+            return new WindowsUiaDiagnostics(false, false, UiaTimeoutMs, ex.Message);
+        }
+    }
+
+    private static WindowsCaptureDiagnostics Capture(bool isWindows)
+    {
+        if (!isWindows)
+        {
+            return new WindowsCaptureDiagnostics(false, false, false, "not_windows");
+        }
+
+        try
+        {
+            return new WindowsCaptureDiagnostics(GraphicsCaptureSession.IsSupported(), true, true, null);
+        }
+        catch (Exception ex)
+        {
+            return new WindowsCaptureDiagnostics(false, true, true, ex.Message);
+        }
+    }
+
+    private static WindowsOcrDiagnostics Ocr(bool isWindows)
+    {
+        if (!isWindows)
+        {
+            return new WindowsOcrDiagnostics(false, "not_windows");
+        }
+
+        try
+        {
+            return OcrEngine.TryCreateFromUserProfileLanguages() is null
+                ? new WindowsOcrDiagnostics(false, "Windows OCR engine is unavailable for the current user languages.")
+                : new WindowsOcrDiagnostics(true, null);
+        }
+        catch (Exception ex)
+        {
+            return new WindowsOcrDiagnostics(false, ex.Message);
+        }
+    }
+
+    private static WindowsDpiDiagnostics Dpi(bool isWindows)
+    {
+        if (!isWindows)
+        {
+            return new WindowsDpiDiagnostics(0, 0);
+        }
+
+        try
+        {
+            return new WindowsDpiDiagnostics(Native.GetSystemMetrics(0), Native.GetSystemMetrics(1));
+        }
+        catch
+        {
+            return new WindowsDpiDiagnostics(0, 0);
+        }
+    }
+
+    private static ObjectProbe ProbeWindowStation()
+    {
+        IntPtr handle = IntPtr.Zero;
+        try
+        {
+            handle = Native.OpenWindowStation("WinSta0", false, WindowStationReadAttributes | WindowStationEnumerateDesktops);
+            if (handle == IntPtr.Zero)
+            {
+                return new ObjectProbe(false, false, null, Marshal.GetLastWin32Error(), LastWin32Error());
+            }
+
+            var query = QueryUserObjectName(handle);
+            return new ObjectProbe(true, query.Success, query.Name, query.LastError, query.Error);
+        }
+        catch (Exception ex)
+        {
+            return new ObjectProbe(false, false, null, null, ex.Message);
+        }
+        finally
+        {
+            if (handle != IntPtr.Zero)
+            {
+                Native.CloseWindowStation(handle);
+            }
+        }
+    }
+
+    private static ObjectProbe ProbeDefaultDesktop()
+    {
+        IntPtr handle = IntPtr.Zero;
+        try
+        {
+            handle = Native.OpenDesktop("Default", 0, false, DesktopReadObjects | DesktopEnumerate);
+            if (handle == IntPtr.Zero)
+            {
+                return new ObjectProbe(false, false, null, Marshal.GetLastWin32Error(), LastWin32Error());
+            }
+
+            var query = QueryUserObjectName(handle);
+            return new ObjectProbe(true, query.Success, query.Name, query.LastError, query.Error);
+        }
+        catch (Exception ex)
+        {
+            return new ObjectProbe(false, false, null, null, ex.Message);
+        }
+        finally
+        {
+            if (handle != IntPtr.Zero)
+            {
+                Native.CloseDesktop(handle);
+            }
+        }
+    }
+
+    private static ObjectNameProbe QueryUserObjectName(IntPtr handle)
+    {
+        var buffer = new StringBuilder(256);
+        var ok = Native.GetUserObjectInformation(handle, UoiName, buffer, buffer.Capacity * 2, out _);
+        if (ok)
+        {
+            return new ObjectNameProbe(true, buffer.ToString(), null, null);
+        }
+
+        var error = Marshal.GetLastWin32Error();
+        return new ObjectNameProbe(false, null, error, new Win32Exception(error).Message);
+    }
+
+    private static string ClassName(IntPtr hwnd)
+    {
+        var sb = new StringBuilder(256);
+        var length = Native.GetClassName(hwnd, sb, sb.Capacity);
+        return length <= 0 ? "" : sb.ToString();
+    }
+
+    private static string LastWin32Error()
+    {
+        var error = Marshal.GetLastWin32Error();
+        return new Win32Exception(error).Message;
+    }
+
+    private static string IntegrityLabel(int rid) => rid switch
+    {
+        < 0x00001000 => "untrusted",
+        < 0x00002000 => "low",
+        < 0x00003000 => "medium",
+        < 0x00004000 => "high",
+        < 0x00005000 => "system",
+        _ => "protected"
+    };
+
+    private sealed record ObjectProbe(bool Open, bool Queried, string? Name, int? LastError, string? Error);
+    private sealed record ObjectNameProbe(bool Success, string? Name, int? LastError, string? Error);
 }
 
 internal static partial class Native
@@ -4171,6 +4795,19 @@ internal static partial class Native
     [DllImport("combase.dll", SetLastError = true)] internal static extern int WindowsCreateString([MarshalAs(UnmanagedType.LPWStr)] string sourceString, int length, out IntPtr hstring);
     [DllImport("combase.dll", SetLastError = true)] internal static extern int WindowsDeleteString(IntPtr hstring);
     [DllImport("combase.dll", SetLastError = true)] internal static extern int RoGetActivationFactory(IntPtr activatableClassId, ref Guid iid, out IntPtr factory);
+    [DllImport("kernel32.dll", SetLastError = true)] internal static extern bool ProcessIdToSessionId(int dwProcessId, out int pSessionId);
+    [DllImport("kernel32.dll")] internal static extern uint WTSGetActiveConsoleSessionId();
+    [DllImport("kernel32.dll")] internal static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll", SetLastError = true)] internal static extern bool CloseHandle(IntPtr hObject);
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)] internal static extern IntPtr OpenWindowStation(string lpszWinSta, bool fInherit, uint dwDesiredAccess);
+    [DllImport("user32.dll", SetLastError = true)] internal static extern bool CloseWindowStation(IntPtr hWinSta);
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)] internal static extern IntPtr OpenDesktop(string lpszDesktop, uint dwFlags, bool fInherit, uint dwDesiredAccess);
+    [DllImport("user32.dll", SetLastError = true)] internal static extern bool CloseDesktop(IntPtr hDesktop);
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)] internal static extern bool GetUserObjectInformation(IntPtr hObj, int nIndex, StringBuilder pvInfo, int nLength, out int lpnLengthNeeded);
+    [DllImport("advapi32.dll", SetLastError = true)] internal static extern bool OpenProcessToken(IntPtr processHandle, uint desiredAccess, out IntPtr tokenHandle);
+    [DllImport("advapi32.dll", SetLastError = true)] internal static extern bool GetTokenInformation(IntPtr tokenHandle, int tokenInformationClass, IntPtr tokenInformation, int tokenInformationLength, out int returnLength);
+    [DllImport("advapi32.dll", SetLastError = true)] internal static extern IntPtr GetSidSubAuthorityCount(IntPtr sid);
+    [DllImport("advapi32.dll", SetLastError = true)] internal static extern IntPtr GetSidSubAuthority(IntPtr sid, int subAuthority);
     [DllImport("oleacc.dll", PreserveSig = true)]
     internal static extern int AccessibleObjectFromWindow(
         IntPtr hwnd,
@@ -4191,6 +4828,19 @@ internal struct POINT
 {
     public int X;
     public int Y;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct TOKEN_MANDATORY_LABEL
+{
+    public SID_AND_ATTRIBUTES Label;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct SID_AND_ATTRIBUTES
+{
+    public IntPtr Sid;
+    public uint Attributes;
 }
 
 [StructLayout(LayoutKind.Sequential)]

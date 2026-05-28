@@ -108,6 +108,7 @@ MSAA fallback elements are represented with the same `ElementSnapshot` shape and
 ## Safety and Configuration
 
 Default behavior is local-only. MCP uses stdio only; remote listeners are out of scope for v1. Configuration controls tool allow/deny lists, destructive-action confirmation, snapshot retention, and redaction settings.
+`pbw doctor` reports local diagnostic checks using the existing `DoctorCheck` shape. Windows doctor checks include the current process session, Session 0 detection, WinSta0/default desktop access, foreground window availability, process integrity level, UI Automation smoke status, and capture backend availability. Doctor check details are additive structured diagnostics and consumers must ignore unknown keys.
 
 ## Windows Behavior
 
@@ -136,6 +137,7 @@ Desktop-crop fallback reports occlusion metadata when a safe `WindowFromPoint`
 sample can determine that another root window covers the target. Minimized
 window capture reports `unavailable` with `minimized` and `noPixels` metadata
 instead of returning a misleading image.
+Session and desktop diagnostics are read-only. They do not spawn daemons, open named pipes, start remote listeners, or attempt to bypass Session 0; unavailable access is reported as warning/error check data.
 
 ## MCP Behavior
 

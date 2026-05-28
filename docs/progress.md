@@ -123,3 +123,16 @@
 - Deterministic unit coverage verifies role/state mapping, source metadata, UIA-ok/no-MSAA fallback decisions, UIA empty/degraded/wrapper-only fallback decisions, known-legacy append behavior, MSAA action success details, and MSAA unavailable details.
 - Guarded WPF TestHost validation exercises the real `WindowsMsaaAutomationAdapter` against a repo-controlled process. This validates real oleacc/IAccessible tree access and source metadata, while UIA remains the primary route for WPF semantic actions.
 - Known limitation: the repo does not currently contain a deterministic legacy MSAA-only control whose `accDoDefaultAction` behavior is independent of the UIA provider, so MSAA action routing is covered through seam tests rather than a legacy-app e2e action target.
+
+## Session Doctor Goal Validation
+
+- PATH `dotnet` on this host still has no SDK; validation used `%TEMP%\dotnet-sdk-local\dotnet.exe`.
+- `pbw doctor` now reports read-only session and desktop diagnostics: process session id, Session 0 detection, WinSta0/default desktop open/query status, foreground window availability, process integrity level, UIA smoke status, and capture backend support.
+- `dotnet restore`: passed with the local SDK
+- `dotnet build --configuration Release`: passed with 0 warnings and 0 errors
+- Focused doctor tests: passed, covering session-0 error mapping, desktop query warning mapping, capture fallback warning mapping, non-Windows warning mapping, CLI doctor JSON shape, MCP doctor structured check data, and current-host guarded Windows diagnostics.
+- `dotnet test --configuration Release`: passed, 118 passed, 0 failed, 0 skipped
+- `dotnet format --verify-no-changes --verbosity minimal`: initial run found line-ending normalization only; `dotnet format --verbosity minimal` normalized files, and final verify passed
+- Real CLI smoke `dotnet run --project src/Pbw.Cli -- doctor`: passed. On this host the new checks reported `session`, `interactiveDesktop`, `foreground`, `integrity`, `uia`, and `capture` as `ok`.
+- The implementation is diagnostic-only: it does not add a daemon, named pipe, remote listener, or Session 0 bypass.
+- Known limitation: UIA smoke checks are bounded and can return warning on locked/headless/service contexts; if the underlying Windows/UIA call hangs below COM, the diagnostic returns a timeout warning while the worker call may finish later.
