@@ -590,6 +590,281 @@ public sealed class WindowsUiaRobustnessTests
     }
 }
 
+public sealed class MsaaFallbackTests
+{
+    [Fact]
+    public void MsaaElementMapper_Maps_Role_State_Patterns_And_Metadata()
+    {
+        var info = new MsaaElementInfo(
+            "msaa-1",
+            "Legacy OK",
+            MsaaElementMapper.RoleSystemPushButton,
+            0x00000004 | 0x00000010,
+            new Bounds(10, 20, 100, 30),
+            "Press",
+            null,
+            new IntPtr(0x1234),
+            0,
+            "0",
+            7,
+            "uia_empty",
+            Array.Empty<ElementSnapshot>());
+
+        var snapshot = MsaaElementMapper.ToSnapshot(info);
+
+        Assert.Equal("msaa-1", snapshot.Id);
+        Assert.Equal("Legacy OK", snapshot.Name);
+        Assert.Equal("Button", snapshot.Role);
+        Assert.True(snapshot.Enabled);
+        Assert.True(snapshot.Focused);
+        Assert.Contains("Invoke", snapshot.Patterns ?? Array.Empty<string>());
+        Assert.NotNull(snapshot.Metadata);
+        Assert.Equal("msaa", snapshot.Metadata!["source"]);
+        Assert.Equal("msaa", snapshot.Metadata["elementSource"]);
+        Assert.Equal(MsaaElementMapper.RoleSystemPushButton, snapshot.Metadata["msaaRole"]);
+        Assert.Equal("Button", snapshot.Metadata["msaaRoleName"]);
+        Assert.Equal("Press", snapshot.Metadata["msaaDefaultAction"]);
+        Assert.Equal(7, snapshot.Metadata["msaaTraversalIndex"]);
+        Assert.Equal("0x1234", snapshot.Metadata["windowHandle"]);
+        var states = Assert.IsAssignableFrom<IReadOnlyList<string>>(snapshot.Metadata["msaaStateNames"]);
+        Assert.Contains("Focused", states);
+        Assert.Contains("Checked", states);
+    }
+
+    [Fact]
+    public void WindowsElementAutomationService_Does_Not_Attempt_Msaa_When_Uia_Is_Usable()
+    {
+        var msaa = new FakeMsaaAdapter();
+        var service = new WindowsElementAutomationService(
+            TimeSpan.FromSeconds(1),
+            () => new[] { new ElementSnapshot("uia", "UIA", "Button", new Bounds(1, 2, 3, 4)) },
+            msaa);
+
+        var elements = service.ReadTree();
+
+        Assert.Single(elements);
+        Assert.Equal("uia", elements[0].Id);
+        Assert.Equal(0, msaa.ReadTreeCalls);
+        Assert.Equal(0, msaa.ReadLegacyWindowTreeCalls);
+    }
+
+    [Fact]
+    public void WindowsElementAutomationService_Uses_Msaa_When_Uia_Is_Empty()
+    {
+        var msaa = new FakeMsaaAdapter
+        {
+            Tree = new[] { FakeMsaaElement("msaa-empty-fallback") }
+        };
+        var service = new WindowsElementAutomationService(TimeSpan.FromSeconds(1), () => Array.Empty<ElementSnapshot>(), msaa);
+
+        var elements = service.ReadTree();
+
+        var element = Assert.Single(elements);
+        Assert.Equal("msaa-empty-fallback", element.Id);
+        Assert.Equal("msaa", element.Metadata!["source"]);
+        Assert.Equal(1, msaa.ReadTreeCalls);
+        Assert.Equal(0, msaa.ReadLegacyWindowTreeCalls);
+    }
+
+    [Fact]
+    public void WindowsElementAutomationService_Uses_Msaa_When_Uia_Is_WrapperOnly()
+    {
+        var msaa = new FakeMsaaAdapter
+        {
+            Tree = new[] { FakeMsaaElement("msaa-wrapper-fallback") }
+        };
+        var service = new WindowsElementAutomationService(
+            TimeSpan.FromSeconds(1),
+            () => new[] { new ElementSnapshot("uia-wrapper", "", "Pane", new Bounds(0, 0, 800, 600)) },
+            msaa);
+
+        var elements = service.ReadTree();
+
+        var element = Assert.Single(elements);
+        Assert.Equal("msaa-wrapper-fallback", element.Id);
+        Assert.Equal(1, msaa.ReadTreeCalls);
+    }
+
+    [Fact]
+    public void WindowsElementAutomationService_Uses_Msaa_When_Uia_Is_Degraded()
+    {
+        var msaa = new FakeMsaaAdapter
+        {
+            Tree = new[] { FakeMsaaElement("msaa-degraded-fallback") }
+        };
+        var service = new WindowsElementAutomationService(
+            TimeSpan.FromSeconds(1),
+            () => new[] { WindowsElementAutomationService.DegradedElement("uia-empty", "empty", "empty") },
+            msaa);
+
+        var elements = service.ReadTree();
+
+        var element = Assert.Single(elements);
+        Assert.Equal("msaa-degraded-fallback", element.Id);
+        Assert.Equal("msaa", element.Metadata!["source"]);
+        Assert.Equal(1, msaa.ReadTreeCalls);
+    }
+
+    [Fact]
+    public void WindowsElementAutomationService_Reports_Msaa_Unavailable_When_Fallback_Is_Empty()
+    {
+        var msaa = new FakeMsaaAdapter();
+        var service = new WindowsElementAutomationService(
+            TimeSpan.FromSeconds(1),
+            () => new[] { WindowsElementAutomationService.DegradedElement("uia-empty", "empty", "empty") },
+            msaa);
+
+        var elements = service.ReadTree();
+
+        Assert.Equal(2, elements.Count);
+        Assert.Equal("uia-empty", elements[0].Id);
+        Assert.Equal("msaa-empty", elements[1].Id);
+        var metadata = Assert.IsAssignableFrom<IReadOnlyDictionary<string, object?>>(elements[1].Metadata);
+        Assert.Equal("msaa_empty", metadata["degradationReason"]);
+        var details = Assert.IsAssignableFrom<IReadOnlyDictionary<string, object?>>(metadata["details"]);
+        Assert.Equal("msaa", details["source"]);
+        Assert.Equal("uia_tree_degraded", details["fallbackFrom"]);
+    }
+
+    [Fact]
+    public void WindowsElementAutomationService_Appends_Msaa_For_Known_Legacy_Windows()
+    {
+        var msaa = new FakeMsaaAdapter
+        {
+            HasLegacyWindows = true,
+            LegacyTree = new[] { FakeMsaaElement("msaa-legacy") }
+        };
+        var service = new WindowsElementAutomationService(
+            TimeSpan.FromSeconds(1),
+            () => new[] { new ElementSnapshot("uia", "UIA", "Window", new Bounds(0, 0, 10, 10)) },
+            msaa);
+
+        var elements = service.ReadTree();
+
+        Assert.Equal(new[] { "uia", "msaa-legacy" }, elements.Select(e => e.Id).ToArray());
+        Assert.Equal(0, msaa.ReadTreeCalls);
+        Assert.Equal(1, msaa.ReadLegacyWindowTreeCalls);
+    }
+
+    [Fact]
+    public void WindowsElementAutomationService_Click_Uses_Msaa_When_Uia_Target_Is_Not_Found()
+    {
+        var msaa = new FakeMsaaAdapter
+        {
+            ClickResult = new ActionResult(
+                "click",
+                true,
+                "MSAA.accDoDefaultAction",
+                "msaa-button",
+                Details: new Dictionary<string, object?>
+                {
+                    ["elementSource"] = "msaa",
+                    ["semanticPattern"] = "MSAA.DefaultAction",
+                    ["finalMethod"] = "MSAA.accDoDefaultAction"
+                })
+        };
+        var service = new WindowsElementAutomationService(
+            TimeSpan.FromSeconds(1),
+            () => Array.Empty<ElementSnapshot>(),
+            msaa,
+            findElementCore: _ => null);
+
+        var result = service.Click(new TargetSpec(Text: "Legacy OK", WindowHandle: 0x1234));
+
+        Assert.True(result.Performed);
+        Assert.Equal("MSAA.accDoDefaultAction", result.Method);
+        Assert.NotNull(result.Details);
+        Assert.Equal("msaa", result.Details!["elementSource"]);
+        Assert.Equal("MSAA.DefaultAction", result.Details["semanticPattern"]);
+        Assert.True((bool)result.Details["uiaAttempted"]!);
+        Assert.False((bool)result.Details["uiaPerformed"]!);
+        Assert.Equal("UIAutomation", result.Details["uiaMethod"]);
+        Assert.Equal(1, msaa.ClickCalls);
+    }
+
+    [Fact]
+    public void WindowsElementAutomationService_Click_Preserves_Uia_Result_When_Msaa_Is_Unavailable()
+    {
+        var msaa = new FakeMsaaAdapter
+        {
+            ClickResult = new ActionResult(
+                "click",
+                false,
+                "MSAA",
+                Message: "not found",
+                Details: new Dictionary<string, object?> { ["fallbackReason"] = "msaa_target_not_found" })
+        };
+        var service = new WindowsElementAutomationService(
+            TimeSpan.FromSeconds(1),
+            () => Array.Empty<ElementSnapshot>(),
+            msaa,
+            findElementCore: _ => null);
+
+        var result = service.Click(new TargetSpec(Text: "Missing", WindowHandle: 0x1234));
+
+        Assert.False(result.Performed);
+        Assert.Equal("UIAutomation", result.Method);
+        Assert.NotNull(result.Details);
+        Assert.True((bool)result.Details!["msaaAttempted"]!);
+        Assert.False((bool)result.Details["msaaPerformed"]!);
+        Assert.Equal("msaa_target_not_found", result.Details["msaaFallbackReason"]);
+        Assert.Equal("UIAutomation", result.Details["finalMethod"]);
+    }
+
+    [Fact]
+    public void WindowsElementAutomationService_PerformActionClick_Uses_Msaa_When_Uia_Click_Is_Unavailable()
+    {
+        var msaa = new FakeMsaaAdapter
+        {
+            PerformActionResult = new ActionResult(
+                "perform-action",
+                true,
+                "MSAA.accDoDefaultAction",
+                "msaa-button",
+                Details: new Dictionary<string, object?>
+                {
+                    ["elementSource"] = "msaa",
+                    ["semanticPattern"] = "MSAA.DefaultAction"
+                })
+        };
+        var service = new WindowsElementAutomationService(
+            TimeSpan.FromSeconds(1),
+            () => Array.Empty<ElementSnapshot>(),
+            msaa,
+            findElementCore: _ => AutomationElement.RootElement);
+
+        var result = service.PerformAction(new TargetSpec(Text: "Legacy OK", WindowHandle: 0x1234), "click");
+
+        Assert.True(result.Performed);
+        Assert.Equal("perform-action", result.Action);
+        Assert.Equal("MSAA.accDoDefaultAction", result.Method);
+        Assert.Equal("msaa-button", result.TargetId);
+        Assert.Equal(1, msaa.PerformActionCalls);
+        Assert.Equal(0, msaa.ClickCalls);
+        Assert.NotNull(result.Details);
+        Assert.Equal("msaa", result.Details!["elementSource"]);
+        Assert.Equal("MSAA.DefaultAction", result.Details["semanticPattern"]);
+        Assert.True((bool)result.Details["uiaAttempted"]!);
+        Assert.False((bool)result.Details["uiaPerformed"]!);
+        Assert.Equal("UIAutomation", result.Details["uiaMethod"]);
+        Assert.Equal("semantic_pattern_unavailable", result.Details["uiaFallbackReason"]);
+        Assert.Equal("MSAA.accDoDefaultAction", result.Details["finalMethod"]);
+    }
+
+    private static ElementSnapshot FakeMsaaElement(string id) => new(
+        id,
+        "Legacy",
+        "Button",
+        new Bounds(10, 10, 100, 30),
+        Patterns: new[] { "Invoke" },
+        Metadata: new Dictionary<string, object?>
+        {
+            ["source"] = "msaa",
+            ["elementSource"] = "msaa",
+            ["msaaRole"] = MsaaElementMapper.RoleSystemPushButton
+        });
+}
+
 public sealed class CliTests
 {
     [Fact]
@@ -1028,6 +1303,11 @@ public sealed class WindowsRealApiIntegrationTests
             Assert.True(set.Performed, set.Message);
             Assert.Equal("UIAutomation.ValuePattern", set.Method);
 
+            var msaaAdapter = new WindowsMsaaAutomationAdapter();
+            var msaaElements = msaaAdapter.ReadTree(handle);
+            Assert.NotEmpty(msaaElements);
+            Assert.Contains(msaaElements, element => element.Metadata is not null && Equals(element.Metadata["source"], "msaa"));
+
             var invoke = automation.PerformAction(new TargetSpec(AutomationId: "WriteButton", WindowHandle: handle), "invoke");
             Assert.True(invoke.Performed, invoke.Message);
             Assert.Equal("UIAutomation.InvokePattern", invoke.Method);
@@ -1379,6 +1659,56 @@ internal sealed class FakeAutomation : IElementAutomationService
     public ActionResult ClickDialog(TargetSpec target, string button) => new("dialog.click", false, "fake");
     public ActionResult InputDialog(TargetSpec target, string value) => new("dialog.input", false, "fake");
     public ActionResult DismissDialog(TargetSpec target) => new("dialog.dismiss", false, "fake");
+}
+
+internal sealed class FakeMsaaAdapter : IWindowsMsaaAutomationAdapter
+{
+    public bool HasLegacyWindows { get; init; }
+    public IReadOnlyList<ElementSnapshot> Tree { get; init; } = Array.Empty<ElementSnapshot>();
+    public IReadOnlyList<ElementSnapshot> LegacyTree { get; init; } = Array.Empty<ElementSnapshot>();
+    public ActionResult ClickResult { get; init; } = new(
+        "click",
+        false,
+        "MSAA",
+        Message: "MSAA fake target was not found.",
+        Details: new Dictionary<string, object?> { ["fallbackReason"] = "msaa_target_not_found" });
+    public ActionResult PerformActionResult { get; init; } = new(
+        "perform-action",
+        false,
+        "MSAA",
+        Message: "MSAA fake action was not available.",
+        Details: new Dictionary<string, object?> { ["fallbackReason"] = "msaa_action_unavailable" });
+
+    public int ReadTreeCalls { get; private set; }
+    public int ReadLegacyWindowTreeCalls { get; private set; }
+    public int ClickCalls { get; private set; }
+    public int PerformActionCalls { get; private set; }
+
+    public bool HasKnownLegacyWindows() => HasLegacyWindows;
+
+    public IReadOnlyList<ElementSnapshot> ReadTree(int? windowHandle = null)
+    {
+        ReadTreeCalls++;
+        return Tree;
+    }
+
+    public IReadOnlyList<ElementSnapshot> ReadLegacyWindowTrees()
+    {
+        ReadLegacyWindowTreeCalls++;
+        return LegacyTree;
+    }
+
+    public ActionResult Click(TargetSpec target)
+    {
+        ClickCalls++;
+        return ClickResult;
+    }
+
+    public ActionResult PerformAction(TargetSpec target, string action)
+    {
+        PerformActionCalls++;
+        return PerformActionResult;
+    }
 }
 
 internal sealed class FakeWindowService : IWindowService

@@ -107,3 +107,19 @@
 - WPF TestHost e2e-style validation: passed through the guarded Windows integration test, including real `WindowsElementAutomationService` and `ActionRouter` routes for button InvokePattern, checkbox TogglePattern, textbox ValuePattern, slider RangeValuePattern, and coordinate hit-test semantic routing.
 - Deterministic seam coverage verifies coordinate clicks try semantic routing before input dispatch and report fallback reasons when semantic routing is unavailable.
 - Known limitation: coordinate hit-test semantic routing depends on the current topmost UIA element at the point; when a different window owns the point, pbw falls back to input dispatch with structured fallback details rather than forcing a semantic action.
+
+## MSAA Fallback Goal Validation
+
+- PATH `dotnet` on this host still has no SDK; the literal `dotnet restore` failed with "No .NET SDKs were found", so validation used `%TEMP%\dotnet-sdk-local\dotnet.exe` version 8.0.421.
+- `dotnet restore`: passed with the local SDK
+- `dotnet build --configuration Release`: passed with 0 warnings and 0 errors
+- `dotnet test --configuration Release`: passed, 112 passed, 0 failed, 0 skipped
+- `dotnet format --verify-no-changes --verbosity minimal`: initial run found line-ending normalization and one whitespace formatting change; `dotnet format --verbosity minimal` normalized files, and final verify passed
+- `dotnet run --project src/Pbw.Cli -- doctor`: passed, all checks returned `ok`
+- `dotnet run --project src/Pbw.Cli -- see`: passed, created snapshot `snapshot-1779992317879` with `captureStatus: ok`, `captureMethod: Windows.Graphics.Capture`, `qualityStatus: ok`, and `ocrStatus: ok`
+- UIA remains the primary accessibility path. MSAA is implemented as a bounded additive fallback for empty, degraded, wrapper-only, or known legacy UI trees, and for semantic action lookup after UIA cannot perform the action.
+- MSAA elements use the existing `ElementSnapshot` shape and carry additive metadata such as `source: msaa`, `msaaRole`, `msaaState`, `msaaDefaultAction`, and `windowHandle`.
+- MSAA traversal and action dispatch are bounded by depth, child count, total element count, and a fallback timeout. Provider exceptions and empty MSAA results return degraded metadata instead of raw exceptions.
+- Deterministic unit coverage verifies role/state mapping, source metadata, UIA-ok/no-MSAA fallback decisions, UIA empty/degraded/wrapper-only fallback decisions, known-legacy append behavior, MSAA action success details, and MSAA unavailable details.
+- Guarded WPF TestHost validation exercises the real `WindowsMsaaAutomationAdapter` against a repo-controlled process. This validates real oleacc/IAccessible tree access and source metadata, while UIA remains the primary route for WPF semantic actions.
+- Known limitation: the repo does not currently contain a deterministic legacy MSAA-only control whose `accDoDefaultAction` behavior is independent of the UIA provider, so MSAA action routing is covered through seam tests rather than a legacy-app e2e action target.

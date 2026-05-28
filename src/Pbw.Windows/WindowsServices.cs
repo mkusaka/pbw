@@ -12,6 +12,7 @@ using Windows.Graphics.DirectX.Direct3D11;
 using Windows.Graphics.Imaging;
 using Windows.Media.Ocr;
 using Windows.Storage;
+using MsaaAccessible = Accessibility.IAccessible;
 
 [assembly: System.Runtime.CompilerServices.InternalsVisibleTo("Pbw.Tests")]
 
@@ -26,6 +27,15 @@ public interface IWindowsCaptureService
 public interface IWindowsOcrService
 {
     IReadOnlyList<OcrTextSnapshot> Recognize(string? imagePath);
+}
+
+internal interface IWindowsMsaaAutomationAdapter
+{
+    bool HasKnownLegacyWindows();
+    IReadOnlyList<ElementSnapshot> ReadTree(int? windowHandle = null);
+    IReadOnlyList<ElementSnapshot> ReadLegacyWindowTrees();
+    ActionResult Click(TargetSpec target);
+    ActionResult PerformAction(TargetSpec target, string action);
 }
 
 public sealed record CaptureResult(
@@ -1221,19 +1231,33 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
     private const int MaxChildrenPerNode = 80;
     private const int MaxTotalElements = 1500;
     private static readonly TimeSpan DefaultTreeReadTimeout = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan DefaultMsaaFallbackTimeout = TimeSpan.FromSeconds(2);
 
     private readonly TimeSpan treeReadTimeout;
+    private readonly TimeSpan msaaFallbackTimeout;
     private readonly Func<IReadOnlyList<ElementSnapshot>> readTreeCore;
+    private readonly Func<TargetSpec, AutomationElement?> findElementCore;
+    private readonly IWindowsMsaaAutomationAdapter? msaa;
 
     public WindowsElementAutomationService()
-        : this(DefaultTreeReadTimeout, null)
+        : this(DefaultTreeReadTimeout, null, new WindowsMsaaAutomationAdapter(), DefaultMsaaFallbackTimeout)
     {
     }
 
-    internal WindowsElementAutomationService(TimeSpan treeReadTimeout, Func<IReadOnlyList<ElementSnapshot>>? readTreeCore)
+    internal WindowsElementAutomationService(
+        TimeSpan treeReadTimeout,
+        Func<IReadOnlyList<ElementSnapshot>>? readTreeCore,
+        IWindowsMsaaAutomationAdapter? msaa = null,
+        TimeSpan? msaaFallbackTimeout = null,
+        Func<TargetSpec, AutomationElement?>? findElementCore = null)
     {
         this.treeReadTimeout = treeReadTimeout <= TimeSpan.Zero ? DefaultTreeReadTimeout : treeReadTimeout;
+        this.msaaFallbackTimeout = msaaFallbackTimeout is null || msaaFallbackTimeout <= TimeSpan.Zero
+            ? DefaultMsaaFallbackTimeout
+            : msaaFallbackTimeout.Value;
         this.readTreeCore = readTreeCore ?? ReadTreeCore;
+        this.findElementCore = findElementCore ?? FindElement;
+        this.msaa = msaa;
     }
 
     public IReadOnlyList<ElementSnapshot> ReadTree()
@@ -1243,39 +1267,39 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
             var task = Task.Run(readTreeCore);
             if (task.Wait(treeReadTimeout))
             {
-                return task.GetAwaiter().GetResult();
+                return WithMsaaFallback(task.GetAwaiter().GetResult(), null, "uia_tree_degraded");
             }
 
-            return new[]
+            return WithMsaaFallback(new[]
             {
                 DegradedElement(
                     "uia-timeout",
                     $"UI Automation tree read exceeded {treeReadTimeout.TotalMilliseconds:0} ms.",
                     "timeout",
                     new Dictionary<string, object?> { ["timeoutMs"] = (int)treeReadTimeout.TotalMilliseconds })
-            };
+            }, null, "uia_timeout");
         }
         catch (AggregateException ex)
         {
             var inner = ex.Flatten().InnerException ?? ex;
-            return new[] { DegradedElement("uia-error", inner.Message, "exception", ExceptionDetails(inner)) };
+            return WithMsaaFallback(new[] { DegradedElement("uia-error", inner.Message, "exception", ExceptionDetails(inner)) }, null, "uia_exception");
         }
         catch (Exception ex)
         {
-            return new[] { DegradedElement("uia-error", ex.Message, "exception", ExceptionDetails(ex)) };
+            return WithMsaaFallback(new[] { DegradedElement("uia-error", ex.Message, "exception", ExceptionDetails(ex)) }, null, "uia_exception");
         }
     }
 
     public ActionResult Click(TargetSpec target)
     {
-        var element = FindElement(target);
-        if (element is null) return NotFound("click", target);
-        return TrySemanticClick("click", element);
+        var element = findElementCore(target);
+        var uia = element is null ? NotFound("click", target) : TrySemanticClick("click", element);
+        return uia.Performed ? uia : WithMsaaActionFallback(target, uia, adapter => adapter.Click(target));
     }
 
     public ActionResult SetValue(TargetSpec target, string value)
     {
-        var element = FindElement(target);
+        var element = findElementCore(target);
         if (element is null) return NotFound("set-value", target);
         if (TryGetCurrentPattern<RangeValuePattern>(element, RangeValuePattern.Pattern, out var rangePattern))
         {
@@ -1310,8 +1334,13 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
 
     public ActionResult PerformAction(TargetSpec target, string action)
     {
-        var element = FindElement(target);
-        if (element is null) return NotFound("perform-action", target);
+        var element = findElementCore(target);
+        if (element is null)
+        {
+            var notFound = NotFound("perform-action", target);
+            return WithMsaaActionFallback(target, notFound, adapter => adapter.PerformAction(target, action));
+        }
+
         var normalized = action.ToLowerInvariant();
         try
         {
@@ -1325,7 +1354,10 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
                     }
                     break;
                 case "click":
-                    return TrySemanticClick("perform-action", element);
+                    var clickResult = TrySemanticClick("perform-action", element);
+                    return clickResult.Performed
+                        ? clickResult
+                        : WithMsaaActionFallback(target, clickResult, adapter => adapter.PerformAction(target, action));
                 case "toggle":
                     if (TryGetCurrentPattern<TogglePattern>(element, TogglePattern.Pattern, out var togglePattern))
                     {
@@ -1368,10 +1400,230 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
         }
         catch (Exception ex)
         {
-            return SemanticProviderError("perform-action", element, ex);
+            var providerError = SemanticProviderError("perform-action", element, ex);
+            return WithMsaaActionFallback(target, providerError, adapter => adapter.PerformAction(target, action));
         }
 
-        return SemanticUnavailable("perform-action", element, $"Target does not support action '{action}'.", "semantic_action_unavailable");
+        var unavailable = SemanticUnavailable("perform-action", element, $"Target does not support action '{action}'.", "semantic_action_unavailable");
+        return WithMsaaActionFallback(target, unavailable, adapter => adapter.PerformAction(target, action));
+    }
+
+    private IReadOnlyList<ElementSnapshot> WithMsaaFallback(
+        IReadOnlyList<ElementSnapshot> uiaElements,
+        int? windowHandle,
+        string reason)
+    {
+        if (msaa is null)
+        {
+            return uiaElements;
+        }
+
+        if (ShouldAttemptMsaaTreeFallback(uiaElements))
+        {
+            var msaaElements = RunMsaaTreeRead(reason, adapter => adapter.ReadTree(windowHandle));
+            return MsaaReadSucceeded(msaaElements)
+                ? msaaElements
+                : uiaElements.Concat(msaaElements).ToArray();
+        }
+
+        if (windowHandle is null && msaa.HasKnownLegacyWindows())
+        {
+            var legacyElements = RunMsaaTreeRead("known_legacy_window", adapter => adapter.ReadLegacyWindowTrees());
+            return MsaaReadSucceeded(legacyElements)
+                ? uiaElements.Concat(legacyElements).ToArray()
+                : uiaElements;
+        }
+
+        return uiaElements;
+    }
+
+    internal static bool ShouldAttemptMsaaTreeFallback(IReadOnlyList<ElementSnapshot> uiaElements) =>
+        uiaElements.Count == 0 || uiaElements.All(IsDegradedElement) || IsWrapperOnlyTree(uiaElements);
+
+    private IReadOnlyList<ElementSnapshot> RunMsaaTreeRead(
+        string reason,
+        Func<IWindowsMsaaAutomationAdapter, IReadOnlyList<ElementSnapshot>> read)
+    {
+        if (msaa is null)
+        {
+            return Array.Empty<ElementSnapshot>();
+        }
+
+        try
+        {
+            var task = Task.Run(() => read(msaa));
+            if (!task.Wait(msaaFallbackTimeout))
+            {
+                return new[]
+                {
+                    DegradedElement(
+                        "msaa-timeout",
+                        $"MSAA fallback tree read exceeded {msaaFallbackTimeout.TotalMilliseconds:0} ms.",
+                        "msaa_timeout",
+                        new Dictionary<string, object?>
+                        {
+                            ["source"] = "msaa",
+                            ["fallbackFrom"] = reason,
+                            ["timeoutMs"] = (int)msaaFallbackTimeout.TotalMilliseconds
+                        })
+                };
+            }
+
+            var elements = task.GetAwaiter().GetResult();
+            return elements.Count == 0
+                ? new[]
+                {
+                    DegradedElement(
+                        "msaa-empty",
+                        "MSAA fallback returned no elements.",
+                        "msaa_empty",
+                        new Dictionary<string, object?>
+                        {
+                            ["source"] = "msaa",
+                            ["fallbackFrom"] = reason
+                        })
+                }
+                : elements;
+        }
+        catch (AggregateException ex)
+        {
+            var inner = ex.Flatten().InnerException ?? ex;
+            return new[]
+            {
+                DegradedElement(
+                    "msaa-error",
+                    inner.Message,
+                    "msaa_exception",
+                    MergeDetails(ExceptionDetails(inner), new Dictionary<string, object?> { ["source"] = "msaa", ["fallbackFrom"] = reason }))
+            };
+        }
+        catch (Exception ex)
+        {
+            return new[]
+            {
+                DegradedElement(
+                    "msaa-error",
+                    ex.Message,
+                    "msaa_exception",
+                    MergeDetails(ExceptionDetails(ex), new Dictionary<string, object?> { ["source"] = "msaa", ["fallbackFrom"] = reason }))
+            };
+        }
+    }
+
+    private ActionResult WithMsaaActionFallback(
+        TargetSpec target,
+        ActionResult uiaResult,
+        Func<IWindowsMsaaAutomationAdapter, ActionResult> msaaAction)
+    {
+        if (msaa is null)
+        {
+            return uiaResult;
+        }
+
+        ActionResult msaaResult;
+        try
+        {
+            var task = Task.Run(() => msaaAction(msaa));
+            if (!task.Wait(msaaFallbackTimeout))
+            {
+                msaaResult = new ActionResult(
+                    uiaResult.Action,
+                    false,
+                    "MSAA",
+                    target.ToString(),
+                    $"MSAA fallback action exceeded {msaaFallbackTimeout.TotalMilliseconds:0} ms.",
+                    new Dictionary<string, object?>
+                    {
+                        ["elementSource"] = "msaa",
+                        ["fallbackReason"] = "msaa_timeout",
+                        ["timeoutMs"] = (int)msaaFallbackTimeout.TotalMilliseconds
+                    });
+            }
+            else
+            {
+                msaaResult = task.GetAwaiter().GetResult();
+            }
+        }
+        catch (AggregateException ex)
+        {
+            var inner = ex.Flatten().InnerException ?? ex;
+            msaaResult = new ActionResult(
+                uiaResult.Action,
+                false,
+                "MSAA",
+                target.ToString(),
+                inner.Message,
+                MergeDetails(ExceptionDetails(inner), new Dictionary<string, object?> { ["elementSource"] = "msaa", ["fallbackReason"] = "msaa_exception" }));
+        }
+        catch (Exception ex)
+        {
+            msaaResult = new ActionResult(
+                uiaResult.Action,
+                false,
+                "MSAA",
+                target.ToString(),
+                ex.Message,
+                MergeDetails(ExceptionDetails(ex), new Dictionary<string, object?> { ["elementSource"] = "msaa", ["fallbackReason"] = "msaa_exception" }));
+        }
+
+        return msaaResult.Performed ? WithUiaFallbackDetails(msaaResult, uiaResult) : WithMsaaFallbackDetails(uiaResult, msaaResult);
+    }
+
+    private static bool MsaaReadSucceeded(IReadOnlyList<ElementSnapshot> elements) =>
+        elements.Count > 0 && elements.Any(e => !IsDegradedElement(e));
+
+    private static bool IsDegradedElement(ElementSnapshot element) =>
+        element.Metadata is not null &&
+        element.Metadata.TryGetValue("degraded", out var degraded) &&
+        degraded is bool b &&
+        b;
+
+    private static bool IsWrapperOnlyTree(IReadOnlyList<ElementSnapshot> elements)
+    {
+        if (elements.Count != 1)
+        {
+            return false;
+        }
+
+        var element = elements[0];
+        var childCount = element.Children?.Count ?? 0;
+        var patternCount = element.Patterns?.Count ?? 0;
+        return childCount == 0 &&
+            patternCount == 0 &&
+            string.IsNullOrWhiteSpace(element.Name) &&
+            element.Role is "Window" or "Pane" or "Custom" or "unknown";
+    }
+
+    private static ActionResult WithUiaFallbackDetails(ActionResult result, ActionResult uiaAttempt)
+    {
+        var details = result.Details is null ? new Dictionary<string, object?>() : new Dictionary<string, object?>(result.Details);
+        details["uiaAttempted"] = true;
+        details["uiaPerformed"] = uiaAttempt.Performed;
+        details["uiaMethod"] = uiaAttempt.Method;
+        details["uiaFallbackReason"] = ActionFallbackReason(uiaAttempt, "uia_unavailable");
+        details["finalMethod"] = result.Method;
+        return result with { Details = details };
+    }
+
+    private static ActionResult WithMsaaFallbackDetails(ActionResult result, ActionResult msaaAttempt)
+    {
+        var details = result.Details is null ? new Dictionary<string, object?>() : new Dictionary<string, object?>(result.Details);
+        details["msaaAttempted"] = true;
+        details["msaaPerformed"] = msaaAttempt.Performed;
+        details["msaaMethod"] = msaaAttempt.Method;
+        details["msaaFallbackReason"] = ActionFallbackReason(msaaAttempt, "msaa_unavailable");
+        details["finalMethod"] = result.Method;
+        return result with { Details = details };
+    }
+
+    private static object? ActionFallbackReason(ActionResult attempt, string defaultReason)
+    {
+        if (attempt.Details is not null && attempt.Details.TryGetValue("fallbackReason", out var reason))
+        {
+            return reason;
+        }
+
+        return string.IsNullOrWhiteSpace(attempt.Message) ? defaultReason : attempt.Message;
     }
 
     public IReadOnlyList<MenuItemInfo> ListMenus(TargetSpec target)
@@ -2224,6 +2476,19 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
         ["message"] = ex.Message
     };
 
+    private static IReadOnlyDictionary<string, object?> MergeDetails(
+        IReadOnlyDictionary<string, object?> first,
+        IReadOnlyDictionary<string, object?> second)
+    {
+        var result = new Dictionary<string, object?>(first);
+        foreach (var (key, value) in second)
+        {
+            result[key] = value;
+        }
+
+        return result;
+    }
+
     private static ActionResult NotFound(string action, TargetSpec target) => new(action, false, "UIAutomation", target.ToString(), "Target was not found.");
 
     private sealed class UiaTraversalState(int remaining)
@@ -2266,6 +2531,789 @@ public sealed class WindowsElementAutomationService : IElementAutomationService
         public int CacheFallbacks { get; set; }
         public string? LastCacheError { get; set; }
     }
+}
+
+internal sealed class WindowsMsaaAutomationAdapter : IWindowsMsaaAutomationAdapter
+{
+    private const int ChildIdSelf = 0;
+    private const int MaxDepth = 5;
+    private const int MaxChildrenPerNode = 80;
+    private const int MaxTotalElements = 1500;
+    private const int MaxRootWindows = 24;
+    private const uint ObjidClient = 0xFFFFFFFC;
+
+    public bool HasKnownLegacyWindows() => EnumerateCandidateWindows(legacyOnly: true).Any();
+
+    public IReadOnlyList<ElementSnapshot> ReadTree(int? windowHandle = null) =>
+        ReadTrees(ResolveCandidateWindows(windowHandle, legacyOnly: false), "msaa_fallback");
+
+    public IReadOnlyList<ElementSnapshot> ReadLegacyWindowTrees() =>
+        ReadTrees(EnumerateCandidateWindows(legacyOnly: true), "known_legacy_window");
+
+    public ActionResult Click(TargetSpec target) => InvokeDefaultAction("click", target, "invoke");
+
+    public ActionResult PerformAction(TargetSpec target, string action)
+    {
+        var normalized = action.Trim().ToLowerInvariant();
+        if (normalized is "click" or "invoke")
+        {
+            return InvokeDefaultAction("perform-action", target, normalized);
+        }
+
+        return new ActionResult(
+            "perform-action",
+            false,
+            "MSAA",
+            target.ToString(),
+            $"MSAA fallback does not support action '{action}'.",
+            new Dictionary<string, object?>
+            {
+                ["elementSource"] = "msaa",
+                ["fallbackReason"] = "msaa_action_unavailable",
+                ["requestedAction"] = action
+            });
+    }
+
+    private static IReadOnlyList<ElementSnapshot> ReadTrees(IEnumerable<IntPtr> handles, string reason)
+    {
+        var snapshots = new List<ElementSnapshot>();
+        var remaining = MaxTotalElements;
+        foreach (var hwnd in handles.Take(MaxRootWindows))
+        {
+            var accessible = AccessibleFromWindow(hwnd);
+            if (accessible is null)
+            {
+                continue;
+            }
+
+            try
+            {
+                var state = new MsaaTraversalState(remaining);
+                var snapshot = BuildSnapshot(accessible, ChildIdSelf, hwnd, "0", 0, state, reason);
+                if (snapshot is not null)
+                {
+                    snapshots.Add(snapshot);
+                }
+
+                remaining = state.Remaining;
+                if (remaining <= 0)
+                {
+                    snapshots.Add(WindowsElementAutomationService.DegradedElement(
+                        "msaa-limit",
+                        $"MSAA traversal stopped after {MaxTotalElements} elements.",
+                        "msaa_element_limit",
+                        new Dictionary<string, object?> { ["source"] = "msaa", ["maxTotalElements"] = MaxTotalElements }));
+                    break;
+                }
+            }
+            finally
+            {
+                ReleaseComObject(accessible);
+            }
+        }
+
+        return snapshots;
+    }
+
+    private static ActionResult InvokeDefaultAction(string action, TargetSpec target, string requestedAction)
+    {
+        foreach (var hwnd in ResolveActionWindows(target).Take(MaxRootWindows))
+        {
+            var accessible = AccessibleFromWindow(hwnd);
+            if (accessible is null)
+            {
+                continue;
+            }
+
+            try
+            {
+                var state = new MsaaTraversalState(MaxTotalElements);
+                var result = TryInvokeDefaultAction(accessible, ChildIdSelf, hwnd, "0", 0, state, target, action, requestedAction);
+                if (result is not null)
+                {
+                    return result;
+                }
+            }
+            finally
+            {
+                ReleaseComObject(accessible);
+            }
+        }
+
+        return new ActionResult(
+            action,
+            false,
+            "MSAA",
+            target.ToString(),
+            "Target was not found in the bounded MSAA fallback tree.",
+            new Dictionary<string, object?>
+            {
+                ["elementSource"] = "msaa",
+                ["fallbackReason"] = "msaa_target_not_found",
+                ["maxDepth"] = MaxDepth,
+                ["maxTotalElements"] = MaxTotalElements
+            });
+    }
+
+    private static ActionResult? TryInvokeDefaultAction(
+        MsaaAccessible accessible,
+        int childId,
+        IntPtr hwnd,
+        string path,
+        int depth,
+        MsaaTraversalState state,
+        TargetSpec target,
+        string action,
+        string requestedAction)
+    {
+        if (!state.TryEnter(out var traversalIndex))
+        {
+            return null;
+        }
+
+        var info = ReadElementInfo(accessible, childId, hwnd, path, "msaa_action", traversalIndex);
+        if (info is not null && Matches(info, target))
+        {
+            if (!MsaaElementMapper.SupportsDefaultAction(info.Role, info.DefaultAction))
+            {
+                return new ActionResult(
+                    action,
+                    false,
+                    "MSAA",
+                    info.Id,
+                    "MSAA target does not expose a safe default action.",
+                    ActionDetails(info, "msaa_default_action_unavailable", requestedAction));
+            }
+
+            try
+            {
+                accessible.accDoDefaultAction(childId);
+                return new ActionResult(
+                    action,
+                    true,
+                    "MSAA.accDoDefaultAction",
+                    info.Id,
+                    Details: ActionDetails(info, null, requestedAction, "MSAA.accDoDefaultAction"));
+            }
+            catch (Exception ex)
+            {
+                var details = ActionDetails(info, "msaa_provider_error", requestedAction);
+                details["exceptionType"] = ex.GetType().Name;
+                return new ActionResult(action, false, "MSAA.accDoDefaultAction", info.Id, ex.Message, details);
+            }
+        }
+
+        if (depth >= MaxDepth || childId != ChildIdSelf)
+        {
+            return null;
+        }
+
+        foreach (var child in EnumerateChildren(accessible).Take(MaxChildrenPerNode))
+        {
+            if (child.Accessible is not null)
+            {
+                try
+                {
+                    var result = TryInvokeDefaultAction(child.Accessible, ChildIdSelf, hwnd, $"{path}.{child.ChildId}", depth + 1, state, target, action, requestedAction);
+                    if (result is not null)
+                    {
+                        return result;
+                    }
+                }
+                finally
+                {
+                    if (!ReferenceEquals(child.Accessible, accessible))
+                    {
+                        ReleaseComObject(child.Accessible);
+                    }
+                }
+            }
+            else
+            {
+                var result = TryInvokeDefaultAction(accessible, child.ChildId, hwnd, $"{path}.{child.ChildId}", depth + 1, state, target, action, requestedAction);
+                if (result is not null)
+                {
+                    return result;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static ElementSnapshot? BuildSnapshot(
+        MsaaAccessible accessible,
+        int childId,
+        IntPtr hwnd,
+        string path,
+        int depth,
+        MsaaTraversalState state,
+        string reason)
+    {
+        if (!state.TryEnter(out var traversalIndex))
+        {
+            return null;
+        }
+
+        var info = ReadElementInfo(accessible, childId, hwnd, path, reason, traversalIndex);
+        if (info is null)
+        {
+            return null;
+        }
+
+        var children = new List<ElementSnapshot>();
+        if (depth < MaxDepth && childId == ChildIdSelf)
+        {
+            foreach (var child in EnumerateChildren(accessible).Take(MaxChildrenPerNode))
+            {
+                ElementSnapshot? childSnapshot;
+                if (child.Accessible is not null)
+                {
+                    try
+                    {
+                        childSnapshot = BuildSnapshot(child.Accessible, ChildIdSelf, hwnd, $"{path}.{child.ChildId}", depth + 1, state, reason);
+                    }
+                    finally
+                    {
+                        if (!ReferenceEquals(child.Accessible, accessible))
+                        {
+                            ReleaseComObject(child.Accessible);
+                        }
+                    }
+                }
+                else
+                {
+                    childSnapshot = BuildSnapshot(accessible, child.ChildId, hwnd, $"{path}.{child.ChildId}", depth + 1, state, reason);
+                }
+
+                if (childSnapshot is not null)
+                {
+                    children.Add(childSnapshot);
+                }
+
+                if (state.Remaining <= 0)
+                {
+                    break;
+                }
+            }
+        }
+
+        return MsaaElementMapper.ToSnapshot(info with { Children = children });
+    }
+
+    private static MsaaElementInfo? ReadElementInfo(
+        MsaaAccessible accessible,
+        int childId,
+        IntPtr hwnd,
+        string path,
+        string reason,
+        int traversalIndex)
+    {
+        try
+        {
+            var name = SafeString(() => accessible.get_accName(childId));
+            var role = SafeInt(() => accessible.get_accRole(childId));
+            var state = SafeInt(() => accessible.get_accState(childId));
+            var defaultAction = SafeString(() => accessible.get_accDefaultAction(childId));
+            var bounds = SafeLocation(accessible, childId);
+            var value = SafeString(() => accessible.get_accValue(childId));
+            var id = "msaa-" + hwnd.ToInt64().ToString("x") + "-" + path;
+            return new MsaaElementInfo(
+                id,
+                string.IsNullOrWhiteSpace(name) ? null : name,
+                role,
+                state,
+                bounds,
+                string.IsNullOrWhiteSpace(defaultAction) ? null : defaultAction,
+                string.IsNullOrWhiteSpace(value) ? null : value,
+                hwnd,
+                childId,
+                path,
+                traversalIndex,
+                reason,
+                Array.Empty<ElementSnapshot>());
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static IEnumerable<MsaaChild> EnumerateChildren(MsaaAccessible accessible)
+    {
+        int count;
+        try
+        {
+            count = accessible.accChildCount;
+        }
+        catch
+        {
+            yield break;
+        }
+
+        for (var childId = 1; childId <= Math.Min(count, MaxChildrenPerNode); childId++)
+        {
+            MsaaAccessible? childAccessible = null;
+            try
+            {
+                if (accessible.get_accChild(childId) is MsaaAccessible matched)
+                {
+                    childAccessible = matched;
+                }
+            }
+            catch
+            {
+            }
+
+            yield return new MsaaChild(childId, childAccessible);
+        }
+    }
+
+    private static bool Matches(MsaaElementInfo info, TargetSpec target)
+    {
+        if (target.Id is not null)
+        {
+            return info.Id.Equals(target.Id, StringComparison.OrdinalIgnoreCase);
+        }
+
+        if (target.AutomationId is not null)
+        {
+            return false;
+        }
+
+        if (target.Text is not null)
+        {
+            return info.Name is not null && info.Name.Contains(target.Text, StringComparison.OrdinalIgnoreCase);
+        }
+
+        if (target.Role is not null)
+        {
+            return MsaaElementMapper.RoleName(info.Role).Equals(target.Role, StringComparison.OrdinalIgnoreCase);
+        }
+
+        if (target.X is not null && target.Y is not null)
+        {
+            return info.Bounds.Width > 0 &&
+                info.Bounds.Height > 0 &&
+                target.X.Value >= info.Bounds.X &&
+                target.X.Value <= info.Bounds.X + info.Bounds.Width &&
+                target.Y.Value >= info.Bounds.Y &&
+                target.Y.Value <= info.Bounds.Y + info.Bounds.Height;
+        }
+
+        if (target.Index is not null)
+        {
+            return info.TraversalIndex == target.Index.Value;
+        }
+
+        return false;
+    }
+
+    private static Dictionary<string, object?> ActionDetails(
+        MsaaElementInfo info,
+        string? fallbackReason,
+        string requestedAction,
+        string finalMethod = "MSAA")
+    {
+        var details = MsaaElementMapper.Metadata(info).ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+        details["semanticPattern"] = "MSAA.DefaultAction";
+        details["requestedAction"] = requestedAction;
+        details["finalMethod"] = finalMethod;
+        if (fallbackReason is not null)
+        {
+            details["fallbackReason"] = fallbackReason;
+        }
+
+        return details;
+    }
+
+    private static IEnumerable<IntPtr> ResolveCandidateWindows(int? windowHandle, bool legacyOnly)
+    {
+        if (windowHandle is not null)
+        {
+            var hwnd = new IntPtr(windowHandle.Value);
+            if (hwnd != IntPtr.Zero && Native.IsWindow(hwnd))
+            {
+                yield return RootWindow(hwnd);
+            }
+
+            yield break;
+        }
+
+        foreach (var hwnd in EnumerateCandidateWindows(legacyOnly))
+        {
+            yield return hwnd;
+        }
+    }
+
+    private static IEnumerable<IntPtr> ResolveActionWindows(TargetSpec target)
+    {
+        if (target.WindowHandle is not null)
+        {
+            foreach (var hwnd in ResolveCandidateWindows(target.WindowHandle, legacyOnly: false))
+            {
+                yield return hwnd;
+            }
+
+            yield break;
+        }
+
+        if (target.X is not null && target.Y is not null)
+        {
+            var hit = Native.WindowFromPoint(new POINT { X = target.X.Value, Y = target.Y.Value });
+            if (hit != IntPtr.Zero)
+            {
+                yield return RootWindow(hit);
+            }
+
+            yield break;
+        }
+
+        foreach (var hwnd in EnumerateCandidateWindows(legacyOnly: true))
+        {
+            yield return hwnd;
+        }
+    }
+
+    private static IEnumerable<IntPtr> EnumerateCandidateWindows(bool legacyOnly)
+    {
+        var handles = new List<IntPtr>();
+        try
+        {
+            Native.EnumWindows((hwnd, _) =>
+            {
+                if (handles.Count >= MaxRootWindows)
+                {
+                    return false;
+                }
+
+                if (hwnd == IntPtr.Zero || !Native.IsWindowVisible(hwnd) || Native.IsIconic(hwnd))
+                {
+                    return true;
+                }
+
+                var root = RootWindow(hwnd);
+                if (root == IntPtr.Zero || handles.Contains(root))
+                {
+                    return true;
+                }
+
+                if (legacyOnly && !IsKnownLegacyClass(ClassName(root)))
+                {
+                    return true;
+                }
+
+                Native.GetWindowRect(root, out var rect);
+                if (rect.Right <= rect.Left || rect.Bottom <= rect.Top)
+                {
+                    return true;
+                }
+
+                handles.Add(root);
+                return true;
+            }, IntPtr.Zero);
+        }
+        catch
+        {
+        }
+
+        return handles;
+    }
+
+    private static bool IsKnownLegacyClass(string className) =>
+        className.StartsWith("SAL", StringComparison.OrdinalIgnoreCase) ||
+        className.StartsWith("VCL", StringComparison.OrdinalIgnoreCase) ||
+        className.StartsWith("Thunder", StringComparison.OrdinalIgnoreCase) ||
+        className.StartsWith("Afx:", StringComparison.OrdinalIgnoreCase) ||
+        className.StartsWith("ATL:", StringComparison.OrdinalIgnoreCase);
+
+    private static string ClassName(IntPtr hwnd)
+    {
+        var sb = new StringBuilder(256);
+        var length = Native.GetClassName(hwnd, sb, sb.Capacity);
+        return length <= 0 ? "" : sb.ToString();
+    }
+
+    private static IntPtr RootWindow(IntPtr hwnd)
+    {
+        var root = Native.GetAncestor(hwnd, Native.GaRoot);
+        return root == IntPtr.Zero ? hwnd : root;
+    }
+
+    private static MsaaAccessible? AccessibleFromWindow(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero)
+        {
+            return null;
+        }
+
+        var iid = new Guid("618736E0-3C3D-11CF-810C-00AA00389B71");
+        var hr = Native.AccessibleObjectFromWindow(hwnd, ObjidClient, ref iid, out var accessible);
+        return hr < 0 || accessible is not MsaaAccessible typed ? null : typed;
+    }
+
+    private static Bounds SafeLocation(MsaaAccessible accessible, int childId)
+    {
+        try
+        {
+            accessible.accLocation(out var left, out var top, out var width, out var height, childId);
+            return width > 0 && height > 0 ? new Bounds(left, top, width, height) : new Bounds(0, 0, 0, 0);
+        }
+        catch
+        {
+            return new Bounds(0, 0, 0, 0);
+        }
+    }
+
+    private static string? SafeString(Func<string?> read)
+    {
+        try
+        {
+            return read();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static int SafeInt(Func<object?> read)
+    {
+        try
+        {
+            var value = read();
+            return value switch
+            {
+                int i => i,
+                short s => s,
+                uint u when u <= int.MaxValue => (int)u,
+                string text when int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed) => parsed,
+                _ => 0
+            };
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    private static void ReleaseComObject(object? value)
+    {
+        if (value is null || !Marshal.IsComObject(value))
+        {
+            return;
+        }
+
+        try
+        {
+            Marshal.FinalReleaseComObject(value);
+        }
+        catch
+        {
+        }
+    }
+
+    private sealed record MsaaChild(int ChildId, MsaaAccessible? Accessible);
+
+    private sealed class MsaaTraversalState(int remaining)
+    {
+        public int Remaining { get; private set; } = remaining;
+        private int visited;
+
+        public bool TryEnter(out int traversalIndex)
+        {
+            traversalIndex = -1;
+            if (Remaining <= 0)
+            {
+                return false;
+            }
+
+            traversalIndex = visited;
+            visited++;
+            Remaining--;
+            return true;
+        }
+    }
+}
+
+internal sealed record MsaaElementInfo(
+    string Id,
+    string? Name,
+    int Role,
+    int State,
+    Bounds Bounds,
+    string? DefaultAction,
+    string? Value,
+    IntPtr WindowHandle,
+    int ChildId,
+    string Path,
+    int TraversalIndex,
+    string FallbackReason,
+    IReadOnlyList<ElementSnapshot> Children);
+
+internal static class MsaaElementMapper
+{
+    internal const int RoleSystemTitleBar = 0x01;
+    internal const int RoleSystemMenuBar = 0x02;
+    internal const int RoleSystemScrollBar = 0x03;
+    internal const int RoleSystemWindow = 0x09;
+    internal const int RoleSystemClient = 0x0A;
+    internal const int RoleSystemMenuPopup = 0x0B;
+    internal const int RoleSystemMenuItem = 0x0C;
+    internal const int RoleSystemToolTip = 0x0D;
+    internal const int RoleSystemDialog = 0x12;
+    internal const int RoleSystemGrouping = 0x14;
+    internal const int RoleSystemToolBar = 0x16;
+    internal const int RoleSystemStatusBar = 0x17;
+    internal const int RoleSystemLink = 0x1E;
+    internal const int RoleSystemList = 0x21;
+    internal const int RoleSystemListItem = 0x22;
+    internal const int RoleSystemPageTab = 0x25;
+    internal const int RoleSystemGraphic = 0x28;
+    internal const int RoleSystemStaticText = 0x29;
+    internal const int RoleSystemText = 0x2A;
+    internal const int RoleSystemPushButton = 0x2B;
+    internal const int RoleSystemCheckButton = 0x2C;
+    internal const int RoleSystemRadioButton = 0x2D;
+    internal const int RoleSystemComboBox = 0x2E;
+    internal const int RoleSystemProgressBar = 0x30;
+    internal const int RoleSystemSlider = 0x33;
+    internal const int RoleSystemButtonDropDown = 0x38;
+    internal const int RoleSystemButtonMenu = 0x39;
+    internal const int RoleSystemButtonDropDownGrid = 0x3A;
+    internal const int RoleSystemPageTabList = 0x3C;
+    internal const int RoleSystemSplitButton = 0x3E;
+
+    private const int StateSystemUnavailable = 0x00000001;
+    private const int StateSystemFocused = 0x00000004;
+    private const int StateSystemChecked = 0x00000010;
+    private const int StateSystemReadOnly = 0x00000040;
+    private const int StateSystemExpanded = 0x00000200;
+    private const int StateSystemCollapsed = 0x00000400;
+    private const int StateSystemInvisible = 0x00008000;
+
+    public static ElementSnapshot ToSnapshot(MsaaElementInfo info) => new(
+        info.Id,
+        info.Name,
+        RoleName(info.Role),
+        info.Bounds,
+        AutomationId: null,
+        Enabled: (info.State & StateSystemUnavailable) == 0,
+        Focused: (info.State & StateSystemFocused) != 0,
+        Patterns: Patterns(info.Role, info.DefaultAction),
+        Children: info.Children,
+        Metadata: Metadata(info));
+
+    public static IReadOnlyDictionary<string, object?> Metadata(MsaaElementInfo info)
+    {
+        var metadata = new Dictionary<string, object?>
+        {
+            ["source"] = "msaa",
+            ["elementSource"] = "msaa",
+            ["msaaRole"] = info.Role,
+            ["msaaRoleName"] = RoleName(info.Role),
+            ["msaaState"] = info.State,
+            ["msaaStateNames"] = StateNames(info.State),
+            ["msaaDefaultAction"] = info.DefaultAction,
+            ["msaaValue"] = info.Value,
+            ["msaaChildId"] = info.ChildId,
+            ["msaaPath"] = info.Path,
+            ["msaaTraversalIndex"] = info.TraversalIndex,
+            ["windowHandle"] = FormatHwnd(info.WindowHandle),
+            ["fallbackReason"] = info.FallbackReason
+        };
+        return metadata;
+    }
+
+    public static string RoleName(int role) => role switch
+    {
+        RoleSystemTitleBar => "TitleBar",
+        RoleSystemMenuBar => "MenuBar",
+        RoleSystemScrollBar => "ScrollBar",
+        RoleSystemWindow => "Window",
+        RoleSystemClient => "Pane",
+        RoleSystemMenuPopup => "Menu",
+        RoleSystemMenuItem => "MenuItem",
+        RoleSystemToolTip => "ToolTip",
+        RoleSystemDialog => "Window",
+        RoleSystemGrouping => "Group",
+        RoleSystemToolBar => "ToolBar",
+        RoleSystemStatusBar => "StatusBar",
+        RoleSystemLink => "Hyperlink",
+        RoleSystemList => "List",
+        RoleSystemListItem => "ListItem",
+        RoleSystemPageTab => "TabItem",
+        RoleSystemGraphic => "Image",
+        RoleSystemStaticText => "Text",
+        RoleSystemText => "Edit",
+        RoleSystemPushButton => "Button",
+        RoleSystemCheckButton => "CheckBox",
+        RoleSystemRadioButton => "RadioButton",
+        RoleSystemComboBox => "ComboBox",
+        RoleSystemProgressBar => "ProgressBar",
+        RoleSystemSlider => "Slider",
+        RoleSystemButtonDropDown or RoleSystemButtonMenu or RoleSystemButtonDropDownGrid or RoleSystemSplitButton => "SplitButton",
+        RoleSystemPageTabList => "Tab",
+        0 => "Unknown",
+        _ => "Role_0x" + role.ToString("X", CultureInfo.InvariantCulture)
+    };
+
+    public static IReadOnlyList<string> StateNames(int state)
+    {
+        var names = new List<string>();
+        AddState(state, StateSystemUnavailable, "Unavailable", names);
+        AddState(state, StateSystemFocused, "Focused", names);
+        AddState(state, StateSystemChecked, "Checked", names);
+        AddState(state, StateSystemReadOnly, "ReadOnly", names);
+        AddState(state, StateSystemExpanded, "Expanded", names);
+        AddState(state, StateSystemCollapsed, "Collapsed", names);
+        AddState(state, StateSystemInvisible, "Invisible", names);
+        return names;
+    }
+
+    public static IReadOnlyList<string> Patterns(int role, string? defaultAction)
+    {
+        var patterns = new List<string>();
+        if (SupportsDefaultAction(role, defaultAction))
+        {
+            patterns.Add("Invoke");
+        }
+
+        if (IsDropdown(role))
+        {
+            patterns.Add("ExpandCollapse");
+        }
+
+        return patterns;
+    }
+
+    public static bool SupportsDefaultAction(int role, string? defaultAction) =>
+        !string.IsNullOrWhiteSpace(defaultAction) ||
+        role is RoleSystemPushButton or
+            RoleSystemCheckButton or
+            RoleSystemRadioButton or
+            RoleSystemLink or
+            RoleSystemMenuItem or
+            RoleSystemListItem or
+            RoleSystemPageTab or
+            RoleSystemComboBox or
+            RoleSystemButtonDropDown or
+            RoleSystemButtonMenu or
+            RoleSystemButtonDropDownGrid or
+            RoleSystemSplitButton;
+
+    private static bool IsDropdown(int role) =>
+        role is RoleSystemButtonDropDown or RoleSystemButtonMenu or RoleSystemButtonDropDownGrid or RoleSystemSplitButton;
+
+    private static void AddState(int state, int flag, string name, ICollection<string> names)
+    {
+        if ((state & flag) != 0)
+        {
+            names.Add(name);
+        }
+    }
+
+    private static string FormatHwnd(IntPtr hwnd) => "0x" + hwnd.ToInt64().ToString("x");
 }
 
 public sealed class WindowsOcrService : IWindowsOcrService
@@ -3123,6 +4171,12 @@ internal static partial class Native
     [DllImport("combase.dll", SetLastError = true)] internal static extern int WindowsCreateString([MarshalAs(UnmanagedType.LPWStr)] string sourceString, int length, out IntPtr hstring);
     [DllImport("combase.dll", SetLastError = true)] internal static extern int WindowsDeleteString(IntPtr hstring);
     [DllImport("combase.dll", SetLastError = true)] internal static extern int RoGetActivationFactory(IntPtr activatableClassId, ref Guid iid, out IntPtr factory);
+    [DllImport("oleacc.dll", PreserveSig = true)]
+    internal static extern int AccessibleObjectFromWindow(
+        IntPtr hwnd,
+        uint dwId,
+        ref Guid riid,
+        [MarshalAs(UnmanagedType.Interface)] out object? ppvObject);
 }
 
 internal struct RECT

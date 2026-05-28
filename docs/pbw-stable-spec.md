@@ -103,6 +103,7 @@ diagnostics, `qualityStatus`, `captureBounds`, `win32Bounds`,
 `minimized`, and `noPixels`. Consumers must ignore unknown metadata keys.
 
 Elements include stable IDs, names, roles, bounds, automation IDs, state, supported patterns, children, and optional metadata. Element metadata is additive; consumers must ignore unknown keys. UI Automation degraded placeholder elements may set metadata keys such as `degraded`, `degradationReason`, `message`, and `details`.
+MSAA fallback elements are represented with the same `ElementSnapshot` shape and set additive metadata such as `source: "msaa"`, `elementSource: "msaa"`, `msaaRole`, `msaaRoleName`, `msaaState`, `msaaStateNames`, `msaaDefaultAction`, and `windowHandle`. Consumers must treat these keys as optional diagnostics.
 
 ## Safety and Configuration
 
@@ -121,8 +122,10 @@ The Windows layer should prefer native APIs in this order:
 
 Unavailable capabilities must be reported through structured degraded results rather than raw exceptions.
 UI Automation tree reads use bounded cache requests for serialized element properties and common action patterns, falling back to uncached reads if providers reject cached access. Expensive tree reads are bounded by a timeout and may return a degraded placeholder element instead of blocking the whole snapshot path. Window-scoped UIA lookup may retry from the desktop root filtered by HWND/process relationship when a direct window root does not expose the requested descendants.
+UI Automation remains the primary accessibility provider. MSAA is an additive Windows fallback for empty, degraded, wrapper-only, or known legacy provider cases. MSAA traversal is bounded by depth, child, total element, and timeout limits; unavailable MSAA fallback is reported as degraded metadata rather than raw provider exceptions.
 Semantic `set-value` supports `ValuePattern` for text-like controls and `RangeValuePattern` for numeric range controls. RangeValue results include additive details such as requested value, current range bounds, and `errorCode` for invalid numeric values, read-only controls, out-of-range values, or provider errors.
 Element-targeted clicks and coordinate clicks prefer UI Automation hit-test and semantic click patterns before input dispatch. Semantic click routing tries `InvokePattern`, `TogglePattern`, `SelectionItemPattern`, and `ExpandCollapsePattern`; `ScrollItemPattern` may be used as a pre-action to bring the target into view. Input fallback reports the semantic fallback reason in additive action details.
+If UIA semantic action lookup is unavailable, MSAA may perform a safe default action through `accDoDefaultAction` before input dispatch. MSAA action details are additive and may include `elementSource`, `semanticPattern: "MSAA.DefaultAction"`, `uiaFallbackReason`, `msaaFallbackReason`, and `finalMethod`.
 Background input that cannot be delivered safely is reported as
 `background_unavailable` with a reason and retry hint instead of silently sending
 foreground/global input.
