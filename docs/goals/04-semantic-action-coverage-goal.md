@@ -21,6 +21,12 @@ Read first:
     - libs/cua-driver/rust/crates/platform-windows/src/tools/impl_.rs
     - libs/cua-driver/rust/crates/platform-windows/src/uia/mod.rs
 
+Worker rules:
+1. You are not alone in the codebase. Do not revert edits made by others; adapt to existing changes if present.
+2. Do not commit. The orchestrator will review, request follow-up fixes if needed, and commit.
+3. Keep edits within the ownership scope implied by this goal unless a narrowly-scoped supporting change is required.
+4. Return with: files changed, implementation summary, tests/commands run and results, skipped or guarded e2e reasons, and known limitations.
+
 Scope:
 1. Prefer semantic UIA actions for element targets:
    - InvokePattern
