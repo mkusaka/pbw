@@ -254,6 +254,45 @@ public sealed class CaptureDiagnosticsTests
         Assert.Equal("windowFromPoint", details["occlusionCheck"]);
     }
 
+    [Fact]
+    public void WindowsCaptureService_DesktopCropOcclusionDetails_Report_Unavailable_When_Target_Cannot_Be_Sampled()
+    {
+        var details = WindowsCaptureService.BuildDesktopCropOcclusionDetails(IntPtr.Zero, new Bounds(0, 0, 100, 100));
+
+        Assert.Null(details["occluded"]);
+        Assert.Equal("unavailable", details["occlusionCheck"]);
+        Assert.Contains("HWND", (string)details["occlusionMessage"]!);
+    }
+
+    [Fact]
+    public void WindowsCaptureService_Invalid_Window_Bounds_Result_Includes_QualityStatus()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var path = Path.Combine(Path.GetTempPath(), "pbw-invalid-window-" + Guid.NewGuid().ToString("N") + ".bmp");
+        try
+        {
+            var result = new WindowsCaptureService().CaptureWindow(0, path, Array.Empty<ElementSnapshot>());
+
+            Assert.False(result.Success);
+            Assert.Equal("window.bounds", result.Method);
+            Assert.Equal(CaptureQualityStatus.Unavailable, result.Status);
+            Assert.Null(result.ImagePath);
+            Assert.NotNull(result.Details);
+            Assert.Equal(CaptureQualityStatus.Unavailable, result.Details!["qualityStatus"]);
+            var attempts = Assert.IsAssignableFrom<IReadOnlyList<CaptureAttempt>>(result.Details["attempts"]);
+            Assert.Empty(attempts);
+            Assert.False(File.Exists(path));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
     private static void WriteBmp(string path, int width, int height, Func<int, int, (byte R, byte G, byte B)> pixel)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);

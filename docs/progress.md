@@ -60,8 +60,9 @@
 - PATH `dotnet` on this host still has no SDK; validation used the repo's local .NET 8 SDK at `%TEMP%\dotnet-sdk-local\dotnet.exe`.
 - `dotnet restore`: passed
 - `dotnet build --configuration Release`: passed with 0 warnings and 0 errors
-- `dotnet test --configuration Release`: passed, 72 passed, 0 failed, 0 skipped
+- `dotnet test --configuration Release`: passed, 74 passed, 0 failed, 0 skipped
 - `dotnet format --verify-no-changes --verbosity minimal`: initial run found line-ending normalization only; `dotnet format --verbosity minimal` normalized files, and final verify passed
 - `dotnet run --project src/Pbw.Cli -- doctor`: passed, all checks returned `ok`
 - `dotnet run --project src/Pbw.Cli -- see`: passed, created a snapshot and BMP image with `captureStatus: ok`, `captureMethod: Windows.Graphics.Capture`, and additive `captureDetails` quality/attempt metadata
 - WPF TestHost e2e-style validation: passed through `WindowsCaptureService`, asserted capture metadata, and verified minimized-window capture returns `unavailable` with `minimized` and `noPixels`
+- Deterministic metadata coverage now includes desktop-crop occlusion `unavailable` reporting and invalid-window bounds failures carrying `qualityStatus: unavailable`.

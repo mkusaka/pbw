@@ -12,6 +12,8 @@ using Windows.Graphics.Imaging;
 using Windows.Media.Ocr;
 using Windows.Storage;
 
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("Pbw.Tests")]
+
 namespace Pbw.Windows;
 
 public interface IWindowsCaptureService
@@ -933,9 +935,8 @@ public sealed class WindowsCaptureService : IWindowsCaptureService
                 "window.bounds",
                 null,
                 boundsMessage,
-                CaptureQualityStatus.Unavailable,
-                new Dictionary<string, object?> { ["attempts"] = attempts.ToArray() });
-            return failure;
+                CaptureQualityStatus.Unavailable);
+            return FinalizeResult(failure, attempts, new Dictionary<string, object?>());
         }
 
         var commonDetails = WindowBoundsDetails(windowBounds);
@@ -979,15 +980,7 @@ public sealed class WindowsCaptureService : IWindowsCaptureService
         }
 
         var occlusion = TryGetOcclusion(hwnd, windowBounds.CaptureBounds);
-        var desktopCropDetails = new Dictionary<string, object?>
-        {
-            ["occluded"] = occlusion.Occluded,
-            ["occlusionCheck"] = occlusion.Status
-        };
-        if (occlusion.Message is not null)
-        {
-            desktopCropDetails["occlusionMessage"] = occlusion.Message;
-        }
+        var desktopCropDetails = BuildDesktopCropOcclusionDetails(occlusion);
 
         var desktopCropRaw = CaptureRegion(IntPtr.Zero, windowBounds.CaptureBounds, imagePath, "BitBlt.desktop-crop");
         var desktopCrop = desktopCropRaw with
@@ -1144,9 +1137,32 @@ public sealed class WindowsCaptureService : IWindowsCaptureService
         }
     }
 
+    internal static IReadOnlyDictionary<string, object?> BuildDesktopCropOcclusionDetails(IntPtr hwnd, Bounds bounds) =>
+        BuildDesktopCropOcclusionDetails(TryGetOcclusion(hwnd, bounds));
+
+    private static Dictionary<string, object?> BuildDesktopCropOcclusionDetails(OcclusionResult occlusion)
+    {
+        var details = new Dictionary<string, object?>
+        {
+            ["occluded"] = occlusion.Occluded,
+            ["occlusionCheck"] = occlusion.Status
+        };
+        if (occlusion.Message is not null)
+        {
+            details["occlusionMessage"] = occlusion.Message;
+        }
+
+        return details;
+    }
+
     private static OcclusionResult TryGetOcclusion(IntPtr hwnd, Bounds bounds)
     {
-        if (hwnd == IntPtr.Zero || bounds.Width <= 4 || bounds.Height <= 4)
+        if (hwnd == IntPtr.Zero)
+        {
+            return new OcclusionResult(null, "unavailable", "Target HWND was unavailable for occlusion sampling.");
+        }
+
+        if (bounds.Width <= 4 || bounds.Height <= 4)
         {
             return new OcclusionResult(null, "unavailable", "Target bounds were too small for occlusion sampling.");
         }
