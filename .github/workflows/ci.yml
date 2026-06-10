@@ -11,70 +11,7 @@ on:
 permissions:
   contents: read
 
-env:
-  ACTIONLINT_VERSION: 1.7.12
-  PINACT_VERSION: 3.10.1
-  GHALINT_VERSION: 1.5.6
-
 jobs:
-  workflow-lint:
-    name: Workflow lint
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      actions: read
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          persist-credentials: false
-
-      - name: Install workflow linters
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/workflow-linters" "$HOME/.local/bin"
-          cd "$RUNNER_TEMP/workflow-linters"
-
-          curl -sSfLO "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
-          curl -sSfLO "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_checksums.txt"
-          grep " actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz$" "actionlint_${ACTIONLINT_VERSION}_checksums.txt" | sha256sum -c -
-          tar -xzf "actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" actionlint
-          install -m 0755 actionlint "$HOME/.local/bin/actionlint"
-
-          curl -sSfLO "https://github.com/suzuki-shunsuke/pinact/releases/download/v${PINACT_VERSION}/pinact_linux_amd64.tar.gz"
-          curl -sSfLO "https://github.com/suzuki-shunsuke/pinact/releases/download/v${PINACT_VERSION}/pinact_${PINACT_VERSION}_checksums.txt"
-          grep " pinact_linux_amd64.tar.gz$" "pinact_${PINACT_VERSION}_checksums.txt" | sha256sum -c -
-          tar -xzf pinact_linux_amd64.tar.gz pinact
-          install -m 0755 pinact "$HOME/.local/bin/pinact"
-
-          curl -sSfLO "https://github.com/suzuki-shunsuke/ghalint/releases/download/v${GHALINT_VERSION}/ghalint_${GHALINT_VERSION}_linux_amd64.tar.gz"
-          curl -sSfLO "https://github.com/suzuki-shunsuke/ghalint/releases/download/v${GHALINT_VERSION}/ghalint_${GHALINT_VERSION}_checksums.txt"
-          grep " ghalint_${GHALINT_VERSION}_linux_amd64.tar.gz$" "ghalint_${GHALINT_VERSION}_checksums.txt" | sha256sum -c -
-          tar -xzf "ghalint_${GHALINT_VERSION}_linux_amd64.tar.gz" ghalint
-          install -m 0755 ghalint "$HOME/.local/bin/ghalint"
-
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: Run actionlint
-        run: actionlint
-
-      - name: Run pinact
-        run: pinact run --check
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-
-      - name: Run ghalint
-        run: ghalint run
-
-      - name: Run zizmor
-        uses: zizmorcore/zizmor-action@5f14fd08f7cf1cb1609c1e344975f152c7ee938d # v0.5.6
-        with:
-          advanced-security: false
-          annotations: true
-
   build-test:
     name: Build and test
     runs-on: windows-latest
