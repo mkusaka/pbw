@@ -1,7 +1,7 @@
 {
-  minimumReleaseAge: "7days",
   $schema: "https://docs.renovatebot.com/renovate-schema.json",
   extends: ["config:best-practices"],
+  minimumReleaseAge: "7 days",
   dependencyDashboard: true,
   platformAutomerge: false,
   labels: ["dependencies"],
@@ -38,27 +38,13 @@
   customManagers: [
     {
       customType: "regex",
-      managerFilePatterns: ["/^\\.github/workflows/ci\\.yml$/"],
-      matchStrings: ["ACTIONLINT_VERSION:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
-      depNameTemplate: "rhysd/actionlint",
-      datasourceTemplate: "github-releases",
-      versioningTemplate: "semver",
-    },
-    {
-      customType: "regex",
-      managerFilePatterns: ["/^\\.github/workflows/ci\\.yml$/"],
-      matchStrings: ["PINACT_VERSION:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
-      depNameTemplate: "suzuki-shunsuke/pinact",
-      datasourceTemplate: "github-releases",
-      versioningTemplate: "semver",
-    },
-    {
-      customType: "regex",
-      managerFilePatterns: ["/^\\.github/workflows/ci\\.yml$/"],
-      matchStrings: ["GHALINT_VERSION:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
-      depNameTemplate: "suzuki-shunsuke/ghalint",
-      datasourceTemplate: "github-releases",
-      versioningTemplate: "semver",
+      managerFilePatterns: [
+        "/(^|/)\\.(?:github|gitea|forgejo)/(?:workflows|actions)/.+\\.ya?ml$/",
+        "/(^|/)action\\.ya?ml$/",
+      ],
+      matchStrings: [
+        "# renovate: datasource=(?<datasource>[a-zA-Z0-9-._]+?) depName=(?<depName>[^\\s]+?)(?: (?:lookupName|packageName)=(?<packageName>[^\\s]+?))?(?: versioning=(?<versioning>[^\\s]+?))?(?: extractVersion=(?<extractVersion>[^\\s]+?))?(?: registryUrl=(?<registryUrl>[^\\s]+?))?\\s+[A-Za-z0-9_]+?_VERSION\\s*:\\s*[\"']?(?<currentValue>.+?)[\"']?\\s",
+      ],
     },
   ],
 }
