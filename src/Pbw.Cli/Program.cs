@@ -101,8 +101,8 @@ public sealed class PbwCli(
         var dispatch = IsInputCommand(command) ? ArgParser.Dispatch(options) : InputDispatchMode.Auto;
         return command switch
         {
-            "see" => await See(cancellationToken).ConfigureAwait(false),
-            "image" => await Image(cancellationToken).ConfigureAwait(false),
+            "see" => await See(options, cancellationToken).ConfigureAwait(false),
+            "image" => await Image(options, cancellationToken).ConfigureAwait(false),
             "click" => await router.ClickAsync(TargetSpec.FromArgs(tail), dispatch, cancellationToken).ConfigureAwait(false),
             "type" => input.TypeText(Required(options, "text"), dispatch, ArgParser.Int(options, "hwnd")),
             "press" => input.Press(Required(options, "key"), dispatch, ArgParser.Int(options, "hwnd")),
@@ -150,6 +150,20 @@ public sealed class PbwCli(
 
         return command switch
         {
+            "see" or "image" => new
+            {
+                command,
+                usage = $"pbw {command} [--annotate]",
+                options = new object[]
+                {
+                    new
+                    {
+                        name = "--annotate",
+                        @default = false,
+                        description = "Save and return a separately annotated image while preserving the raw capture."
+                    }
+                }
+            },
             "click" => new
             {
                 command,
@@ -212,20 +226,35 @@ public sealed class PbwCli(
         }
     }
 
-    private async Task<object> See(CancellationToken cancellationToken)
+    private async Task<object> See(IReadOnlyDictionary<string, string> options, CancellationToken cancellationToken)
     {
-        var snapshot = await snapshotSource.CaptureAsync(cancellationToken).ConfigureAwait(false);
+        var snapshot = await snapshotSource.CaptureAsync(cancellationToken, CaptureOptions(options)).ConfigureAwait(false);
         snapshot = new SnapshotRedactor(config.Redaction).Redact(snapshot);
         var path = snapshotStore.Save(snapshot);
         return new { snapshot = snapshot with { Metadata = Merge(snapshot.Metadata, "snapshotPath", path) } };
     }
 
-    private async Task<object> Image(CancellationToken cancellationToken)
+    private async Task<object> Image(IReadOnlyDictionary<string, string> options, CancellationToken cancellationToken)
     {
-        var snapshot = await snapshotSource.CaptureAsync(cancellationToken).ConfigureAwait(false);
+        var captureOptions = CaptureOptions(options);
+        var snapshot = await snapshotSource.CaptureAsync(cancellationToken, captureOptions).ConfigureAwait(false);
         snapshot = new SnapshotRedactor(config.Redaction).Redact(snapshot);
         snapshotStore.Save(snapshot);
-        return new { snapshotId = snapshot.Id, imagePath = snapshot.ImagePath, status = snapshot.ImagePath is null ? "degraded" : "ok" };
+        var annotationStatus = MetadataValue(snapshot.Metadata, "annotationStatus");
+        var status = snapshot.ImagePath is null ||
+            (captureOptions.Annotate && !string.Equals(annotationStatus?.ToString(), "ok", StringComparison.OrdinalIgnoreCase))
+            ? "degraded"
+            : "ok";
+        return new
+        {
+            snapshotId = snapshot.Id,
+            imagePath = snapshot.ImagePath,
+            rawImagePath = MetadataValue(snapshot.Metadata, "rawImagePath"),
+            annotatedImagePath = MetadataValue(snapshot.Metadata, "annotatedImagePath"),
+            annotationStatus,
+            annotationMessage = MetadataValue(snapshot.Metadata, "annotationMessage"),
+            status
+        };
     }
 
     private object Window(IReadOnlyList<string> tail, IReadOnlyDictionary<string, string> options)
@@ -373,6 +402,15 @@ public sealed class PbwCli(
     private static string Sub(IReadOnlyList<string> tail) => tail.FirstOrDefault(a => !a.StartsWith("--", StringComparison.Ordinal)) ?? throw new ArgumentException("Subcommand is required.");
     private static string Required(IReadOnlyDictionary<string, string> options, string key) => options.TryGetValue(key, out var value) ? value : throw new ArgumentException($"--{key} is required.");
     private static int Int(IReadOnlyDictionary<string, string> options, string key, int? fallback = null) => ArgParser.Int(options, key) ?? fallback ?? throw new ArgumentException($"--{key} is required and must be an integer.");
+    private static SnapshotCaptureOptions CaptureOptions(IReadOnlyDictionary<string, string> options) =>
+        new(Bool(options, "annotate"));
+    private static bool Bool(IReadOnlyDictionary<string, string> options, string key, bool fallback = false)
+    {
+        if (!options.TryGetValue(key, out var value)) return fallback;
+        return bool.TryParse(value, out var parsed)
+            ? parsed
+            : throw new ArgumentException($"--{key} must be true or false.");
+    }
     private static Bounds Bounds(IReadOnlyDictionary<string, string> options) => new(Int(options, "x"), Int(options, "y"), Int(options, "width"), Int(options, "height"));
     private ActionResult? ConfirmDestructive(IReadOnlyDictionary<string, string> options, string action)
     {
@@ -386,6 +424,8 @@ public sealed class PbwCli(
         copy[key] = value;
         return copy;
     }
+    private static object? MetadataValue(IReadOnlyDictionary<string, object?>? metadata, string key) =>
+        metadata is not null && metadata.TryGetValue(key, out var value) ? value : null;
 }
 
 internal sealed record NoOutput;

@@ -55,8 +55,8 @@ pbw see
 
 Inspection and capture:
 
-- `pbw see`: capture desktop/window context, UI Automation tree, OCR text when available, and snapshot metadata.
-- `pbw image`: capture an image through Windows Graphics Capture where feasible, then PrintWindow/desktop crop fallbacks.
+- `pbw see`: capture unmodified desktop/window context, UI Automation tree, OCR text when available, and snapshot metadata. Add `--annotate` to create and return a separate annotated copy while preserving the raw image.
+- `pbw image`: capture an unmodified image through Windows Graphics Capture where feasible, then PrintWindow/desktop crop fallbacks. Add `--annotate` only when UI bounds should be drawn on a separate copy.
 - `pbw snapshot list|show|inspect|clean`: reuse and manage stored snapshots.
 - `pbw doctor`: report OS, current session and Session 0 status, WinSta0/default desktop availability, foreground window availability, UIA, capture, OCR, DPI/display, integrity, snapshot directory, config, and MCP feasibility.
 
@@ -123,6 +123,18 @@ pbw press --key tab
 pbw type --text "supersecret"
 pbw press --key enter
 ```
+
+Capture a raw image, or request a separate annotated copy when UI bounds are useful:
+
+```powershell
+pbw image
+pbw image --annotate
+```
+
+For annotated captures, use `imagePath` for the annotated copy and
+`rawImagePath` when the unmodified capture is needed. OCR is derived from the
+raw image in both cases. If annotation fails, `pbw image` returns the raw image
+with `status: "degraded"` and structured annotation status/message fields.
 
 Focus a window and set bounds:
 

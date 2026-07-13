@@ -22,6 +22,7 @@ public interface IWindowsCaptureService
 {
     CaptureResult CaptureDesktop(string imagePath, IReadOnlyList<WindowSnapshot> windows, IReadOnlyList<ElementSnapshot> elements);
     CaptureResult CaptureWindow(int handle, string imagePath, IReadOnlyList<ElementSnapshot> elements);
+    void AnnotateDesktop(string rawImagePath, string annotatedImagePath, IReadOnlyList<WindowSnapshot> windows, IReadOnlyList<ElementSnapshot> elements);
 }
 
 public interface IWindowsOcrService
@@ -220,15 +221,45 @@ public sealed class WindowsSnapshotSource(
     IWindowsOcrService ocr,
     string imageDirectory) : ISnapshotSource
 {
-    public Task<Snapshot> CaptureAsync(CancellationToken cancellationToken)
+    public Task<Snapshot> CaptureAsync(CancellationToken cancellationToken, SnapshotCaptureOptions? options = null)
     {
+        options ??= new SnapshotCaptureOptions();
         var id = "snapshot-" + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var windowSnapshots = windows.ListWindows();
         var elements = automation.ReadTree();
         Directory.CreateDirectory(imageDirectory);
-        var imagePath = Path.Combine(imageDirectory, id + ".bmp");
-        var captureResult = capture.CaptureDesktop(imagePath, windowSnapshots, elements);
+        var rawImagePath = Path.Combine(imageDirectory, id + ".bmp");
+        var captureResult = capture.CaptureDesktop(rawImagePath, windowSnapshots, elements);
         var ocrText = ocr.Recognize(captureResult.ImagePath);
+        var imagePath = captureResult.ImagePath;
+        string? annotatedImagePath = null;
+        string annotationStatus;
+        string? annotationMessage = null;
+        if (!options.Annotate)
+        {
+            annotationStatus = "disabled";
+        }
+        else if (captureResult.ImagePath is null)
+        {
+            annotationStatus = "unavailable";
+        }
+        else
+        {
+            try
+            {
+                annotatedImagePath = Path.Combine(imageDirectory, id + ".annotated.bmp");
+                capture.AnnotateDesktop(captureResult.ImagePath, annotatedImagePath, windowSnapshots, elements);
+                imagePath = annotatedImagePath;
+                annotationStatus = "ok";
+            }
+            catch (Exception ex)
+            {
+                TryDelete(annotatedImagePath);
+                annotatedImagePath = null;
+                annotationStatus = "error";
+                annotationMessage = ex.Message;
+            }
+        }
         var snapshot = new Snapshot(
             PbwSchema.Version,
             id,
@@ -237,7 +268,7 @@ public sealed class WindowsSnapshotSource(
             windowSnapshots,
             elements,
             ocrText,
-            captureResult.ImagePath,
+            imagePath,
             new Dictionary<string, object?>
             {
                 ["captureMethod"] = captureResult.Method,
@@ -245,9 +276,27 @@ public sealed class WindowsSnapshotSource(
                 ["captureMessage"] = captureResult.Message,
                 ["captureDetails"] = captureResult.Details,
                 ["ocrStatus"] = ocrText.Count > 0 ? "ok" : "empty",
-                ["annotationStatus"] = captureResult.ImagePath is null ? "unavailable" : "ok"
+                ["rawImagePath"] = captureResult.ImagePath,
+                ["annotatedImagePath"] = annotatedImagePath,
+                ["annotationStatus"] = annotationStatus,
+                ["annotationMessage"] = annotationMessage
             });
         return Task.FromResult(snapshot);
+    }
+
+    private static void TryDelete(string? path)
+    {
+        if (path is null) return;
+        try
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
     }
 }
 
@@ -3377,23 +3426,15 @@ public sealed class WindowsCaptureService : IWindowsCaptureService
             ["captureBounds"] = bounds,
             ["boundsSource"] = "primaryMonitor"
         };
-        var annotationBounds = windows.Select(w => w.Bounds).Concat(Flatten(elements).Select(e => e.Bounds)).ToArray();
-
         var graphicsResult = AssessBmp(TryCapturePrimaryMonitorWithGraphicsCapture(imagePath));
         attempts.Add(ToAttempt(graphicsResult));
         if (IsUsable(graphicsResult))
         {
-            AnnotateBmp(imagePath, annotationBounds, bounds);
             return FinalizeResult(graphicsResult, attempts, commonDetails);
         }
 
         var result = AssessBmp(CaptureRegion(IntPtr.Zero, bounds, imagePath, "BitBlt.desktop"));
         attempts.Add(ToAttempt(result));
-        if (result.Success)
-        {
-            AnnotateBmp(imagePath, annotationBounds, bounds);
-        }
-
         return FinalizeResult(result, attempts, commonDetails);
     }
 
@@ -3435,12 +3476,10 @@ public sealed class WindowsCaptureService : IWindowsCaptureService
             return FinalizeResult(minimized, attempts, commonDetails);
         }
 
-        var annotationBounds = Flatten(elements).Select(e => e.Bounds).ToArray();
         var graphicsResult = AssessBmp(TryCaptureWindowWithGraphicsCapture(hwnd, imagePath));
         attempts.Add(ToAttempt(graphicsResult));
         if (IsUsable(graphicsResult))
         {
-            AnnotateBmp(imagePath, annotationBounds, windowBounds.CaptureBounds);
             return FinalizeResult(graphicsResult, attempts, commonDetails);
         }
 
@@ -3448,7 +3487,6 @@ public sealed class WindowsCaptureService : IWindowsCaptureService
         attempts.Add(ToAttempt(printWindow));
         if (IsUsable(printWindow))
         {
-            AnnotateBmp(imagePath, annotationBounds, windowBounds.CaptureBounds);
             return FinalizeResult(printWindow, attempts, commonDetails);
         }
 
@@ -3468,11 +3506,22 @@ public sealed class WindowsCaptureService : IWindowsCaptureService
         attempts.Add(ToAttempt(desktopCrop));
         if (desktopCrop.Success)
         {
-            AnnotateBmp(imagePath, annotationBounds, windowBounds.CaptureBounds);
             return FinalizeResult(desktopCrop, attempts, commonDetails);
         }
 
         return FinalizeResult(desktopCrop, attempts, commonDetails);
+    }
+
+    public void AnnotateDesktop(
+        string rawImagePath,
+        string annotatedImagePath,
+        IReadOnlyList<WindowSnapshot> windows,
+        IReadOnlyList<ElementSnapshot> elements)
+    {
+        File.Copy(rawImagePath, annotatedImagePath, overwrite: true);
+        var bounds = new Bounds(0, 0, Native.GetSystemMetrics(0), Native.GetSystemMetrics(1));
+        var annotationBounds = windows.Select(w => w.Bounds).Concat(Flatten(elements).Select(e => e.Bounds));
+        AnnotateBmp(annotatedImagePath, annotationBounds, bounds);
     }
 
     private static bool IsUsable(CaptureResult result) => result.Success && result.Status == CaptureQualityStatus.Ok;

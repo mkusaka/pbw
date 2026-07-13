@@ -285,8 +285,10 @@ public static class ErrorMapper
 
 public interface ISnapshotSource
 {
-    Task<Snapshot> CaptureAsync(CancellationToken cancellationToken);
+    Task<Snapshot> CaptureAsync(CancellationToken cancellationToken, SnapshotCaptureOptions? options = null);
 }
+
+public sealed record SnapshotCaptureOptions(bool Annotate = false);
 
 public interface IWindowService
 {

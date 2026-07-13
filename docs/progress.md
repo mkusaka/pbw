@@ -20,7 +20,7 @@
 - The host initially had no .NET SDK installed. Validation was run with a local .NET 8 SDK installed under the user temp directory for this session.
 - UI Automation tree reading and common pattern execution are implemented through real Windows UI Automation APIs. Integration tests launch a real WPF process and exercise ValuePattern and InvokePattern.
 - Window capture is implemented through Windows.Graphics.Capture using HWND interop, with `PrintWindow` and `BitBlt` fallback paths.
-- Desktop capture is implemented through Windows.Graphics.Capture using monitor interop, with `BitBlt` fallback. Annotated BMP snapshots are written for successful captures.
+- Desktop capture is implemented through Windows.Graphics.Capture using monitor interop, with `BitBlt` fallback. Raw BMP snapshots are the default; `--annotate` preserves the raw image and writes a separate annotated copy after OCR.
 - OCR is implemented through Windows.Media.Ocr. If the Windows OCR engine is unavailable for the current user languages, the service returns an empty result and doctor reports a warning.
 - Clipboard uses Win32 APIs with an in-process fallback for locked/non-interactive clipboard sessions.
 - MCP is stdio-only and does not expose shell execution or a remote listener.

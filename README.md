@@ -44,9 +44,15 @@ Run from source:
 dotnet run --project src/Pbw.Cli -- --help
 dotnet run --project src/Pbw.Cli -- doctor
 dotnet run --project src/Pbw.Cli -- see
+dotnet run --project src/Pbw.Cli -- image
+dotnet run --project src/Pbw.Cli -- image --annotate
 ```
 
 All commands return structured JSON envelopes with `schemaVersion`.
+
+`pbw see` and `pbw image` save and return an unmodified capture by default. Pass
+`--annotate` to preserve that raw BMP and create a separate `.annotated.bmp`
+copy with window and UI Automation bounds. OCR always reads the raw capture.
 
 Input commands (`click`, `type`, `press`, `hotkey`, `scroll`, `drag`, and `move`)
 accept `--dispatch auto|background|foreground`; command-specific help such as
