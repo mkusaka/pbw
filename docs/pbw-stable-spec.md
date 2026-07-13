@@ -28,8 +28,8 @@ Failures use:
 
 The CLI supports:
 
-- `pbw see`
-- `pbw image`
+- `pbw see [--annotate]`
+- `pbw image [--annotate]`
 - `pbw click`
 - `pbw type`
 - `pbw press`
@@ -96,7 +96,13 @@ Snapshots contain:
 
 Capture metadata is additive and must remain compatible with `pbw.stable.v1`.
 Known capture keys include `captureMethod`, `captureStatus`, `captureMessage`,
-and optional `captureDetails`. `captureStatus` is one of `ok`, `degraded`, or
+`rawImagePath`, `annotatedImagePath`, `annotationStatus`, and optional
+`captureDetails`. Captures are raw by default. When annotation is requested,
+the raw image is preserved, OCR runs against it, and a separate annotated image
+is returned through `imagePath`. `annotationStatus` is one of `disabled`, `ok`,
+`unavailable`, or `error`; an annotation failure returns the raw image with a
+degraded command status and an additive `annotationMessage`. `captureStatus`
+is one of `ok`, `degraded`, or
 `unavailable`. `captureDetails` may include fallback `attempts`, BMP `quality`
 diagnostics, `qualityStatus`, `captureBounds`, `win32Bounds`,
 `dwmExtendedFrameBounds`, `boundsSource`, `occluded`, `occlusionCheck`,

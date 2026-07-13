@@ -333,6 +333,65 @@ public sealed class CaptureDiagnosticsTests
     }
 
     [Fact]
+    public async Task WindowsSnapshotSource_Defaults_To_Raw_Image_And_Ocrs_Raw_Content()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "pbw-tests", Guid.NewGuid().ToString("N"));
+        var events = new List<string>();
+        var capture = new RecordingCaptureService(events);
+        var ocr = new RecordingOcrService(events);
+        var source = new WindowsSnapshotSource(new FakeWindowService(), new FakeAutomation(), capture, ocr, root);
+
+        var snapshot = await source.CaptureAsync(CancellationToken.None);
+
+        Assert.Equal(new[] { "capture", "ocr" }, events);
+        Assert.NotNull(snapshot.ImagePath);
+        Assert.Equal("raw", File.ReadAllText(snapshot.ImagePath!));
+        Assert.Equal(snapshot.ImagePath, snapshot.Metadata!["rawImagePath"]);
+        Assert.Null(snapshot.Metadata["annotatedImagePath"]);
+        Assert.Equal("disabled", snapshot.Metadata["annotationStatus"]);
+    }
+
+    [Fact]
+    public async Task WindowsSnapshotSource_Annotates_A_Copy_After_Ocr()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "pbw-tests", Guid.NewGuid().ToString("N"));
+        var events = new List<string>();
+        var capture = new RecordingCaptureService(events);
+        var ocr = new RecordingOcrService(events);
+        var source = new WindowsSnapshotSource(new FakeWindowService(), new FakeAutomation(), capture, ocr, root);
+
+        var snapshot = await source.CaptureAsync(CancellationToken.None, new SnapshotCaptureOptions(Annotate: true));
+
+        Assert.Equal(new[] { "capture", "ocr", "annotate" }, events);
+        var rawImagePath = Assert.IsType<string>(snapshot.Metadata!["rawImagePath"]);
+        var annotatedImagePath = Assert.IsType<string>(snapshot.Metadata["annotatedImagePath"]);
+        Assert.Equal("raw", File.ReadAllText(rawImagePath));
+        Assert.Equal("raw-annotated", File.ReadAllText(annotatedImagePath));
+        Assert.Equal(annotatedImagePath, snapshot.ImagePath);
+        Assert.Equal("ok", snapshot.Metadata["annotationStatus"]);
+    }
+
+    [Fact]
+    public async Task WindowsSnapshotSource_Falls_Back_To_Raw_When_Annotation_Fails()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "pbw-tests", Guid.NewGuid().ToString("N"));
+        var events = new List<string>();
+        var capture = new RecordingCaptureService(events, FailAnnotation: true);
+        var source = new WindowsSnapshotSource(new FakeWindowService(), new FakeAutomation(), capture, new RecordingOcrService(events), root);
+
+        var snapshot = await source.CaptureAsync(CancellationToken.None, new SnapshotCaptureOptions(Annotate: true));
+
+        Assert.Equal(new[] { "capture", "ocr", "annotate" }, events);
+        var rawImagePath = Assert.IsType<string>(snapshot.Metadata!["rawImagePath"]);
+        Assert.Equal(rawImagePath, snapshot.ImagePath);
+        Assert.Equal("raw", File.ReadAllText(rawImagePath));
+        Assert.Null(snapshot.Metadata["annotatedImagePath"]);
+        Assert.Equal("error", snapshot.Metadata["annotationStatus"]);
+        Assert.Equal("annotation failed", snapshot.Metadata["annotationMessage"]);
+        Assert.DoesNotContain(Directory.EnumerateFiles(root), path => path.EndsWith(".annotated.bmp", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
     public void WindowsCaptureService_DesktopCropOcclusionDetails_Report_Unavailable_When_Target_Cannot_Be_Sampled()
     {
         var details = WindowsCaptureService.BuildDesktopCropOcclusionDetails(IntPtr.Zero, new Bounds(0, 0, 100, 100));
@@ -1047,6 +1106,106 @@ public sealed class CliTests
         Assert.Null(input.LastDispatch);
     }
 
+    [Theory]
+    [InlineData("see")]
+    [InlineData("image")]
+    public async Task Cli_Image_Commands_Default_To_Raw_Capture(string command)
+    {
+        var source = new FakeSnapshotSource();
+        var cli = TestCli(source: source);
+
+        var result = await cli.ExecuteAsync(new[] { command });
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.NotNull(source.LastOptions);
+        Assert.False(source.LastOptions!.Annotate);
+    }
+
+    [Theory]
+    [InlineData("see")]
+    [InlineData("image")]
+    public async Task Cli_Image_Commands_Enable_Annotation_Explicitly(string command)
+    {
+        var source = new FakeSnapshotSource();
+        var cli = TestCli(source: source);
+
+        var result = await cli.ExecuteAsync(new[] { command, "--annotate" });
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.NotNull(source.LastOptions);
+        Assert.True(source.LastOptions!.Annotate);
+    }
+
+    [Fact]
+    public async Task Cli_CommandExecutor_Parses_Annotate_Boolean()
+    {
+        var source = new FakeSnapshotSource();
+        var cli = TestCli(source: source);
+
+        var envelope = await cli.ExecuteAsync(
+            "image",
+            new Dictionary<string, object?> { ["annotate"] = true },
+            CancellationToken.None);
+
+        Assert.True(envelope.Ok);
+        Assert.NotNull(source.LastOptions);
+        Assert.True(source.LastOptions!.Annotate);
+    }
+
+    [Fact]
+    public async Task Cli_Annotate_False_Leaves_Image_Raw()
+    {
+        var source = new FakeSnapshotSource();
+        var cli = TestCli(source: source);
+
+        var result = await cli.ExecuteAsync(new[] { "image", "--annotate", "false" });
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.False(source.LastOptions!.Annotate);
+    }
+
+    [Fact]
+    public async Task Cli_Invalid_Annotate_Returns_Structured_Error()
+    {
+        var cli = TestCli();
+        var result = await cli.ExecuteAsync(new[] { "image", "--annotate", "sometimes" });
+        using var doc = JsonDocument.Parse(result.Json);
+
+        Assert.Equal(2, result.ExitCode);
+        Assert.Equal("invalid_argument", doc.RootElement.GetProperty("error").GetProperty("code").GetString());
+    }
+
+    [Fact]
+    public async Task Cli_Image_Reports_Annotation_Failure_As_Degraded()
+    {
+        var cli = TestCli(source: new FailedAnnotationSnapshotSource());
+        var result = await cli.ExecuteAsync(new[] { "image", "--annotate" });
+        using var doc = JsonDocument.Parse(result.Json);
+
+        Assert.Equal(0, result.ExitCode);
+        var data = doc.RootElement.GetProperty("data");
+        Assert.Equal("degraded", data.GetProperty("status").GetString());
+        Assert.Equal("error", data.GetProperty("annotationStatus").GetString());
+        Assert.Equal("annotation failed", data.GetProperty("annotationMessage").GetString());
+        Assert.Equal("raw.bmp", data.GetProperty("imagePath").GetString());
+    }
+
+    [Theory]
+    [InlineData("see")]
+    [InlineData("image")]
+    public async Task Cli_Image_Command_Help_Describes_Annotation(string command)
+    {
+        var cli = TestCli();
+        var result = await cli.ExecuteAsync(new[] { command, "--help" });
+        using var doc = JsonDocument.Parse(result.Json);
+
+        var data = doc.RootElement.GetProperty("data");
+        Assert.Contains("--annotate", data.GetProperty("usage").GetString());
+        var option = data.GetProperty("options")[0];
+        Assert.Equal("--annotate", option.GetProperty("name").GetString());
+        Assert.False(option.GetProperty("default").GetBoolean());
+    }
+
     [Fact]
     public async Task Cli_Click_Element_Returns_Semantic_Action_Details()
     {
@@ -1227,11 +1386,11 @@ public sealed class CliTests
         Assert.True(doc.RootElement.TryGetProperty("data", out _) || doc.RootElement.TryGetProperty("error", out _));
     }
 
-    private static PbwCli TestCli(IInputService? input = null)
+    private static PbwCli TestCli(IInputService? input = null, ISnapshotSource? source = null)
     {
         var root = Path.Combine(Path.GetTempPath(), "pbw-tests", Guid.NewGuid().ToString("N"));
         var config = PbwConfig.Defaults(root);
-        var source = new FakeSnapshotSource();
+        source ??= new FakeSnapshotSource();
         var automation = new FakeAutomation();
         input ??= new FakeInput();
         return new PbwCli(
@@ -1267,6 +1426,8 @@ public sealed class McpTests
         var type = tools.Single(t => t.Name == "type");
         var click = tools.Single(t => t.Name == "click");
         var windowMove = tools.Single(t => t.Name == "window.move");
+        var see = tools.Single(t => t.Name == "see");
+        var image = tools.Single(t => t.Name == "image");
 
         var typeProperties = (IReadOnlyDictionary<string, object?>)type.InputSchema["properties"]!;
         var clickProperties = (IReadOnlyDictionary<string, object?>)click.InputSchema["properties"]!;
@@ -1274,6 +1435,12 @@ public sealed class McpTests
         Assert.Contains("dispatch", typeProperties.Keys);
         Assert.Contains("hwnd", typeProperties.Keys);
         Assert.Contains("dispatch", clickProperties.Keys);
+        var seeAnnotate = Assert.IsAssignableFrom<IReadOnlyDictionary<string, object?>>(((IReadOnlyDictionary<string, object?>)see.InputSchema["properties"]!)["annotate"]);
+        var imageAnnotate = Assert.IsAssignableFrom<IReadOnlyDictionary<string, object?>>(((IReadOnlyDictionary<string, object?>)image.InputSchema["properties"]!)["annotate"]);
+        Assert.Equal("boolean", seeAnnotate["type"]);
+        Assert.False((bool)seeAnnotate["default"]!);
+        Assert.Equal("boolean", imageAnnotate["type"]);
+        Assert.False((bool)imageAnnotate["default"]!);
         Assert.False((bool)type.InputSchema["additionalProperties"]!);
         Assert.Contains("hwnd", ((IReadOnlyDictionary<string, object?>)windowMove.InputSchema["properties"]!).Keys);
         Assert.Contains("width", ((IReadOnlyDictionary<string, object?>)tools.Single(t => t.Name == "window.resize").InputSchema["properties"]!).Keys);
@@ -1360,6 +1527,20 @@ public sealed class McpTests
         Assert.Equal("background", executor.LastArguments!["dispatch"]?.ToString());
         var hwnd = Assert.IsType<JsonElement>(executor.LastArguments["hwnd"]);
         Assert.Equal(42, hwnd.GetInt32());
+    }
+
+    [Fact]
+    public async Task Mcp_Image_Tool_Call_Forwards_Annotate_Field()
+    {
+        var executor = new FakeExecutor();
+        var server = new McpServer(new McpToolRegistry(), executor);
+
+        await server.HandleJsonRpcAsync("""{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"image","arguments":{"annotate":true}}}""");
+
+        Assert.Equal("image", executor.LastCommand);
+        Assert.NotNull(executor.LastArguments);
+        var annotate = Assert.IsType<JsonElement>(executor.LastArguments!["annotate"]);
+        Assert.True(annotate.GetBoolean());
     }
 
     [Fact]
@@ -1685,8 +1866,11 @@ public sealed class WindowsRealApiIntegrationTests
 
 internal sealed class FakeSnapshotSource : ISnapshotSource
 {
-    public Task<Snapshot> CaptureAsync(CancellationToken cancellationToken)
+    public SnapshotCaptureOptions? LastOptions { get; private set; }
+
+    public Task<Snapshot> CaptureAsync(CancellationToken cancellationToken, SnapshotCaptureOptions? options = null)
     {
+        LastOptions = options;
         var snapshot = Snapshot.Empty("fake") with
         {
             Elements = new[]
@@ -1700,7 +1884,7 @@ internal sealed class FakeSnapshotSource : ISnapshotSource
 
 internal sealed class StaticSnapshotSource(IReadOnlyList<ElementSnapshot> elements) : ISnapshotSource
 {
-    public Task<Snapshot> CaptureAsync(CancellationToken cancellationToken) =>
+    public Task<Snapshot> CaptureAsync(CancellationToken cancellationToken, SnapshotCaptureOptions? options = null) =>
         Task.FromResult(Snapshot.Empty("static") with { Elements = elements });
 }
 
@@ -1959,6 +2143,56 @@ internal sealed class MetadataCaptureService(CaptureResult result) : IWindowsCap
 {
     public CaptureResult CaptureDesktop(string imagePath, IReadOnlyList<WindowSnapshot> windows, IReadOnlyList<ElementSnapshot> elements) => result;
     public CaptureResult CaptureWindow(int handle, string imagePath, IReadOnlyList<ElementSnapshot> elements) => result;
+    public void AnnotateDesktop(string rawImagePath, string annotatedImagePath, IReadOnlyList<WindowSnapshot> windows, IReadOnlyList<ElementSnapshot> elements) =>
+        File.Copy(rawImagePath, annotatedImagePath, overwrite: true);
+}
+
+internal sealed class RecordingCaptureService(List<string> events, bool FailAnnotation = false) : IWindowsCaptureService
+{
+    public CaptureResult CaptureDesktop(string imagePath, IReadOnlyList<WindowSnapshot> windows, IReadOnlyList<ElementSnapshot> elements)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(imagePath)!);
+        File.WriteAllText(imagePath, "raw");
+        events.Add("capture");
+        return new CaptureResult(true, "fake", imagePath, Status: CaptureQualityStatus.Ok);
+    }
+
+    public CaptureResult CaptureWindow(int handle, string imagePath, IReadOnlyList<ElementSnapshot> elements) =>
+        CaptureDesktop(imagePath, Array.Empty<WindowSnapshot>(), elements);
+
+    public void AnnotateDesktop(string rawImagePath, string annotatedImagePath, IReadOnlyList<WindowSnapshot> windows, IReadOnlyList<ElementSnapshot> elements)
+    {
+        events.Add("annotate");
+        File.Copy(rawImagePath, annotatedImagePath, overwrite: true);
+        if (FailAnnotation) throw new InvalidOperationException("annotation failed");
+        File.AppendAllText(annotatedImagePath, "-annotated");
+    }
+}
+
+internal sealed class FailedAnnotationSnapshotSource : ISnapshotSource
+{
+    public Task<Snapshot> CaptureAsync(CancellationToken cancellationToken, SnapshotCaptureOptions? options = null) =>
+        Task.FromResult(Snapshot.Empty("annotation-failure") with
+        {
+            ImagePath = "raw.bmp",
+            Metadata = new Dictionary<string, object?>
+            {
+                ["rawImagePath"] = "raw.bmp",
+                ["annotationStatus"] = "error",
+                ["annotationMessage"] = "annotation failed"
+            }
+        });
+}
+
+internal sealed class RecordingOcrService(List<string> events) : IWindowsOcrService
+{
+    public IReadOnlyList<OcrTextSnapshot> Recognize(string? imagePath)
+    {
+        Assert.NotNull(imagePath);
+        Assert.Equal("raw", File.ReadAllText(imagePath!));
+        events.Add("ocr");
+        return Array.Empty<OcrTextSnapshot>();
+    }
 }
 
 internal sealed class EmptyOcrService : IWindowsOcrService

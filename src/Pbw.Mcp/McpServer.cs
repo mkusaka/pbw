@@ -62,6 +62,15 @@ public sealed class McpToolRegistry
 
         switch (name)
         {
+            case "see":
+            case "image":
+                properties["annotate"] = new Dictionary<string, object?>
+                {
+                    ["type"] = "boolean",
+                    ["default"] = false,
+                    ["description"] = "Create and return a separate annotated image while preserving the raw capture."
+                };
+                break;
             case "type": Add("text", "string", true); break;
             case "press": Add("key", "string", true); break;
             case "hotkey": Add("keys", "string", true); break;
