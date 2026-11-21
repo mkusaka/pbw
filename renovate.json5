@@ -1,50 +1,73 @@
 {
   automerge: true,
-  $schema: "https://docs.renovatebot.com/renovate-schema.json",
-  extends: ["config:best-practices"],
-  minimumReleaseAge: "7 days",
-  dependencyDashboard: true,
+  $schema: 'https://docs.renovatebot.com/renovate-schema.json',
+  extends: [
+    'config:best-practices',
+  ],
+  minimumReleaseAge: '7 days',
+  dependencyDashboard: {
+    enabled: true,
+  },
   platformAutomerge: false,
-  labels: ["dependencies"],
-  ignorePaths: ["scoop/pbw.json"],
+  labels: [
+    'dependencies',
+  ],
+  ignorePaths: [
+    'scoop/pbw.json',
+  ],
   packageRules: [
     {
-      description: "Group minor and patch updates for NuGet packages",
-      groupName: "nuget packages (non-major)",
+      description: 'Group minor and patch updates for NuGet packages',
+      groupName: 'nuget packages (non-major)',
       automerge: true,
-      automergeType: "pr",
-      minimumReleaseAge: "7 days",
-      matchManagers: ["nuget"],
-      matchUpdateTypes: ["minor", "patch"],
+      automergeType: 'pr',
+      minimumReleaseAge: '7 days',
+      matchManagers: [
+        'nuget',
+      ],
+      matchUpdateTypes: [
+        'minor',
+        'patch',
+      ],
     },
     {
-      description: "Group minor and patch updates for GitHub Actions",
-      groupName: "github-actions (non-major)",
+      description: 'Group minor and patch updates for GitHub Actions',
+      groupName: 'github-actions (non-major)',
       automerge: true,
-      automergeType: "pr",
-      minimumReleaseAge: "7 days",
-      matchManagers: ["github-actions"],
-      matchUpdateTypes: ["minor", "patch"],
+      automergeType: 'pr',
+      minimumReleaseAge: '7 days',
+      matchManagers: [
+        'github-actions',
+      ],
+      matchUpdateTypes: [
+        'minor',
+        'patch',
+      ],
     },
     {
-      description: "Group minor and patch updates for workflow linter binaries",
-      groupName: "workflow linters (non-major)",
+      description: 'Group minor and patch updates for workflow linter binaries',
+      groupName: 'workflow linters (non-major)',
       automerge: true,
-      automergeType: "pr",
-      minimumReleaseAge: "7 days",
-      matchManagers: ["custom.regex"],
-      matchUpdateTypes: ["minor", "patch"],
+      automergeType: 'pr',
+      minimumReleaseAge: '7 days',
+      matchManagers: [
+        'custom.regex',
+      ],
+      matchUpdateTypes: [
+        'minor',
+        'patch',
+      ],
     },
   ],
   customManagers: [
     {
-      customType: "regex",
+      customType: 'regex',
       managerFilePatterns: [
-        "/(^|/)\\.(?:github|gitea|forgejo)/(?:workflows|actions)/.+\\.ya?ml$/",
-        "/(^|/)action\\.ya?ml$/",
+        '/(^|/)\\.(?:github|gitea|forgejo)/(?:workflows|actions)/.+\\.ya?ml$/',
+        '/(^|/)action\\.ya?ml$/',
       ],
       matchStrings: [
-        "# renovate: datasource=(?<datasource>[a-zA-Z0-9-._]+?) depName=(?<depName>[^\\s]+?)(?: (?:lookupName|packageName)=(?<packageName>[^\\s]+?))?(?: versioning=(?<versioning>[^\\s]+?))?(?: extractVersion=(?<extractVersion>[^\\s]+?))?(?: registryUrl=(?<registryUrl>[^\\s]+?))?\\s+[A-Za-z0-9_]+?_VERSION\\s*:\\s*[\"']?(?<currentValue>.+?)[\"']?\\s",
+        '# renovate: datasource=(?<datasource>[a-zA-Z0-9-._]+?) depName=(?<depName>[^\\s]+?)(?: (?:lookupName|packageName)=(?<packageName>[^\\s]+?))?(?: versioning=(?<versioning>[^\\s]+?))?(?: extractVersion=(?<extractVersion>[^\\s]+?))?(?: registryUrl=(?<registryUrl>[^\\s]+?))?\\s+[A-Za-z0-9_]+?_VERSION\\s*:\\s*["\']?(?<currentValue>.+?)["\']?\\s',
       ],
     },
   ],
